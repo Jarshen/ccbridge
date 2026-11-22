@@ -1,0 +1,7 @@
+/daily/data/
+__pycache__/
+*.py[cod]
+*.sqlite*
+*.db
+*.log
+.env

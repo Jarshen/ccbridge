@@ -1,0 +1,4 @@
+* text=auto
+*.cmd text eol=crlf
+# Verification uses the exact reviewed frontend bytes, including line endings.
+daily/panel.py -text whitespace=cr-at-eol
