@@ -97,7 +97,7 @@ def main():
                         and (not from_cc or r['binding_id']==binding['id'])),None)
             if not found:
                 raise ValueError('本线程没有这个信件 ID 或错误编号的记录')
-            print(json.dumps({k:found[k] for k in ('id','binding_id','receipt','receipt_evidence','state','detail')}))
+            print(json.dumps({k:found[k] for k in ('id','binding_id','receipt','receipt_evidence','state','detail','next_action')}))
             return
         if args.command == "send":
             receipt = None

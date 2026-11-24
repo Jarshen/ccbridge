@@ -8,9 +8,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from uuid import uuid4
 
 from daily.storage import Store
+from daily import paired_inbox
 
 
 def session(label):
@@ -45,6 +47,58 @@ class StorageTests(unittest.TestCase):
         self.assertIsNone(self.worker.execute("SELECT turn FROM turn_handoffs").fetchone())
         self.store.desktop_send(self.thread, "need a decision", str(uuid4()), handoff_turn=turn)
         self.assertEqual(self.worker.execute("SELECT turn FROM turn_handoffs").fetchone(), (turn,))
+
+    def follow_fixture(self):
+        turn = str(uuid4())
+        history = self.path.with_name("history.sqlite")
+        with closing(sqlite3.connect(history)) as db, db:
+            db.execute("CREATE TABLE thread_turns(thread_id, turn_id, status, rollout_ordinal)")
+            db.execute("INSERT INTO thread_turns VALUES(?,?,'inProgress',1)", (self.thread, turn))
+        mail = self.incoming("unknown", "none")
+        self.worker.execute("CREATE TABLE paired_inboxes(binding_id PRIMARY KEY,turn,listen_until)")
+        self.worker.execute("CREATE TABLE paired_letters(mail_id PRIMARY KEY,target_turn,taken_at)")
+        self.worker.execute("INSERT INTO paired_letters VALUES(?,?,NULL)", (mail, turn))
+        self.worker.execute("UPDATE mail SET detail='配对收件箱待领取' WHERE id=?", (mail,))
+        return turn, history, mail
+
+    def test_follow_output_failure_requires_review_and_blocks_duplicate_take(self):
+        turn, history, mail = self.follow_fixture()
+        with patch('builtins.print', side_effect=BrokenPipeError), self.assertRaises(BrokenPipeError):
+            paired_inbox.follow(self.path, history, self.thread, turn)
+        receipt = self.store.receipts(history, mail)[0]
+        self.assertEqual(receipt['receipt'], 'unknown')
+        self.assertIn('勿重复投递', receipt['next_action'])
+        meta = {'threadId': self.thread, 'x-codex-turn-metadata': {'turn_id': turn}}
+        self.assertEqual(paired_inbox.receive(self.path, history, 'take', {'id': mail}, meta)['status'], 'unavailable')
+        self.store.reconcile(mail, 'unknown', '核对完成')
+        self.assertEqual(self.store.receipts(history, mail)[0]['receipt'], 'cancelled')
+
+    def test_turn_ends_after_ready_before_take(self):
+        turn, history, mail = self.follow_fixture()
+        meta = {'threadId': self.thread, 'x-codex-turn-metadata': {'turn_id': turn}}
+        notice = paired_inbox.receive(self.path, history, 'watch', {}, meta)
+        self.assertEqual(notice['id'], mail)
+        with closing(sqlite3.connect(history)) as db, db:
+            db.execute("UPDATE thread_turns SET status='completed'")
+        self.assertEqual(paired_inbox.receive(self.path, history, 'take', {'id': mail}, meta)['status'], 'unavailable')
+        self.assertEqual(self.worker.execute('SELECT taken_at FROM paired_letters').fetchone(), (None,))
+        self.assertEqual(self.store.receipts(history, mail)[0]['receipt'], 'registered')
+
+    def test_follow_records_success_only_after_output_and_exits_with_turn(self):
+        turn, history, mail = self.follow_fixture()
+        events = []
+        def output(line, *, flush):
+            self.assertTrue(flush)
+            event = json.loads(line)
+            events.append(event['status'])
+            if event['status'] == 'taken':
+                self.assertEqual(self.store.receipts(history, mail)[0]['receipt'], 'unknown')
+                with closing(sqlite3.connect(history)) as db, db:
+                    db.execute("UPDATE thread_turns SET status='completed'")
+        with patch('builtins.print', side_effect=output):
+            paired_inbox.follow(self.path, history, self.thread, turn)
+        self.assertEqual(events, ['taken', 'unavailable'])
+        self.assertEqual(self.store.receipts(history, mail)[0]['receipt'], 'delivered')
 
     def test_receipt_needs_matching_thread_id_and_entire_native_body(self):
         mail=self.incoming("queued","none")

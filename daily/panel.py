@@ -1011,7 +1011,7 @@ class Panel:
 
             id_label='错误编号' if m.get('receipt')=='not_sent' else '信件 ID'
             text = (f"{m.get('body') or '—'}\n\n发件回执　{receipt_label(m)}\n依据　{m.get('receipt_evidence') or '—'}\n处理详情　{m.get('detail') or '—'}\n回复　{m.get('reply') or '—'}\n\n{id_label}　{m['id']}　　处理状态　{STATES.get(state, state)}（{state}）{state_note}\n"
-                    f"回复模式　{reply_mode_label}\n"
+                    f"下一步　{m.get('next_action') or '查看处理详情'}\n回复模式　{reply_mode_label}\n"
                     f"配对 {m.get('binding_id', '')}　{src.upper()} → {dst.upper()}\n"
                     f"发件　{m.get(src+'_title', '')}　{m.get(src, '')}\n"
                     f"收件　{m.get(dst+'_title', '')}　{m.get(dst, '')}\n"

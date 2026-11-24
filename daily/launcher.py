@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import socket
 import sqlite3
 import struct
@@ -514,6 +515,67 @@ def launch(acceptance):
                 subprocess.Popen([sys.executable, "-c", RUN_VERIFIED, *args], stdin=verified, **options)
 
 
+def doctor(project):
+    """Probe the installed runtime without starting the bridge or changing a profile."""
+    c = configure(False, os.environ)
+    checks = []
+
+    def check(label, ok, detail):
+        checks.append(bool(ok))
+        print(f"[{'OK' if ok else '缺失'}] {label}  {detail}")
+
+    try:
+        import tkinter
+        check('Python / Tk', True, f'{sys.version.split()[0]} / Tk {tkinter.TkVersion}')
+    except ImportError:
+        check('Python / Tk', False, '请为当前 Python 安装 Tcl/Tk。')
+    check('CloudCLI Desktop', c.electron.is_file(), c.electron)
+    package = read_json(c.root / 'package.json') or {}
+    server_ok = (package.get('name') == '@cloudcli-ai/cloudcli' and package.get('version') == VERSION
+                 and (c.root / 'dist-server/server/index.js').is_file())
+    check('CloudCLI 服务包', server_ok, f'{VERSION} · {c.root}')
+    cc = database_path(c.root, c.home, c.env)
+    check('Claude 会话索引', cc.is_file(), cc)
+    check('Desktop 会话索引', c.desktop.is_file(), c.desktop)
+    panel, _, problem = select_frontend()
+    check('工作台面板', not problem, problem or panel.name)
+    if c.electron.is_file():
+        # Run the same queue --help capability check used by the worker.
+        try:
+            probe = subprocess.run([c.electron, '--input-type=module', '-e',
+                "import {queueCli} from './codex-cli.mjs';console.log(await queueCli())"],
+                cwd=DAILY, env=dict(c.env, ELECTRON_RUN_AS_NODE='1'), capture_output=True,
+                encoding='utf8', errors='replace', timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
+            check('Codex queue', probe.returncode == 0,
+                  probe.stdout.strip() if probe.returncode == 0 else '检查是否已安装支持 queue 的 Codex CLI。')
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            check('Codex queue', False, str(exc))
+    claude = shutil.which('claude.exe')
+    if claude:
+        try:
+            result = subprocess.run([claude, 'agents', '--json'], capture_output=True,
+                                    encoding='utf8', errors='replace', timeout=8,
+                                    creationflags=subprocess.CREATE_NO_WINDOW, check=True)
+            sessions = json.loads(result.stdout)
+            if not isinstance(sessions, list):
+                raise ValueError('未知的会话清单格式')
+            count = sum(isinstance(s, dict) and s.get('kind') == 'interactive' for s in sessions)
+            print(f'[可选] 独立 Claude CLI  {claude} · 发现 {count} 个交互终端')
+        except (ValueError, OSError, subprocess.SubprocessError):
+            print(f'[可选] 独立 Claude CLI  {claude} · 当前无法列出交互终端')
+    else:
+        print('[可选] 独立 Claude CLI  未发现；CloudCLI 配对仍可使用。')
+    if project is not None:
+        if __package__:
+            from .project_hooks import has_receipt_hooks
+        else:
+            from project_hooks import has_receipt_hooks
+        configured = has_receipt_hooks(project, c.store)
+        print(f"[可选] 项目收件  {project.resolve()} · "
+              + ('已配置，请在 /hooks 核对信任状态。' if configured else '可在面板选择「设置项目收件」。'))
+    return all(checks)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Windows 双会话工作台",
         epilog="端口占用时可先管理配对。待当前工作结束后正常退出 CloudCLI 服务，再次运行同一入口。"
@@ -522,6 +584,8 @@ def main():
     parser.add_argument("--acceptance", action="store_true",
                         help="使用 daily/data/acceptance 下的独立账户、索引和桥存储（默认端口 33180）")
     action = parser.add_mutually_exclusive_group()
+    action.add_argument("--doctor", action="store_true", help="只读检查 Windows 工作台运行依赖。")
+    parser.add_argument("--project", type=Path, help="自检时检查指定项目的收件 hook 配置。")
     action.add_argument("--stop", action="store_true",
                         help="核实启动凭据后直接结束该模式的带桥进程。请先完成所有运行中的工作。")
     action.add_argument("--promote-frontend", metavar="QA_SHA256",
@@ -532,7 +596,12 @@ def main():
                         help="Print the selected frontend and SHA-256. Exit 1 for an unusable pin or file.")
     args = parser.parse_args()
     try:
-        if args.promote_frontend is not None:
+        if args.project is not None and not args.doctor:
+            parser.error('--project 需要配合 --doctor')
+        if args.doctor:
+            if not doctor(args.project):
+                parser.exit(1)
+        elif args.promote_frontend is not None:
             digest = promote_frontend(args.promote_frontend)
             print(f"Activated panel.py SHA-256 {digest}")
         elif args.rollback_frontend:

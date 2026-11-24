@@ -31,7 +31,9 @@ def enrich(store, history_path, rows, only_id=None):
     with closing(store._connect()) as db:
         saved = dict(db.execute('SELECT mail_id,turn_id FROM delivery_evidence'))
         has_inbox = db.execute("SELECT 1 FROM sqlite_master WHERE name='paired_letters'").fetchone()
-        claims = dict(db.execute('SELECT mail_id,target_turn FROM paired_letters WHERE taken_at IS NOT NULL')) if has_inbox else {}
+        claims = dict(db.execute("""SELECT l.mail_id,l.target_turn FROM paired_letters l
+            JOIN mail m ON m.id=l.mail_id WHERE l.taken_at IS NOT NULL
+            AND coalesce(m.detail,'') NOT LIKE '监听输出待核对；%'""")) if has_inbox else {}
         missing = [m for m in rows if m['source']=='cc' and m['id'] not in saved and m['id'] not in claims
                    and m['state'] not in ('queued','failed','cancelled') and m['detail']!='配对收件箱待领取']
         discovered = []
@@ -83,4 +85,25 @@ def enrich(store, history_path, rows, only_id=None):
                              'shown':'已提示发件方','unknown':'提醒结果待核对'}.get(f['state'],f['state']),
                              reply=None,reply_mode='none',created=f['created'],cc=f['cc'],desktop=f['desktop'],
                              cc_title=f['cc_title'],desktop_title=f['desktop_title']))
+    for row in rows:
+        row['next_action'] = receipt_action(row)
     return sorted(rows,key=lambda m:m['created'])
+
+
+def receipt_action(row):
+    stage = row['receipt']
+    if stage == 'not_sent':
+        if row['state'] == 'resolved':
+            return '查看处理详情中的修正结果。'
+        return '按错误编号查看原因和修正进度；确认仍未登记后再修正发件。'
+    if stage == 'delivered':
+        return '在收件会话中核对任务结果。'
+    if stage == 'native_queued':
+        return '等待 Desktop 处理，稍后用原编号查询。'
+    if stage == 'unknown' or row['state'] in ('submitting', 'submitted', 'returning'):
+        return '用原编号核对接收方会话，再决定如何处理；请勿重复投递。'
+    if stage == 'failed':
+        return '先核对双方会话及失败详情；确认原信未送达后再处理。'
+    if stage == 'cancelled':
+        return '该记录已关闭，可在处理详情查看原因。'
+    return '保留当前编号，稍后查询投递进度。'

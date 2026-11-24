@@ -13,7 +13,7 @@ else:
     from zeroqueue import active, connection, identity, serve
 
 
-def receive(store, history_path, name, args, meta, cancelled=None):
+def receive(store, history_path, name, args, meta, cancelled=None, *, stream=False):
     thread, turn = identity(meta)
     deadline = time.monotonic() + (45 if name == 'watch' else 0)
     watch_id=str(uuid4())
@@ -95,8 +95,10 @@ def receive(store, history_path, name, args, meta, cancelled=None):
                     if not row or not active(history,thread,turn):
                         return {'status':'unavailable'}
                     db.execute('UPDATE paired_letters SET taken_at=? WHERE mail_id=?',(time.time(),mail))
-                    db.execute("UPDATE mail SET state='notified',detail=? WHERE id=?",
-                               ('同回合收件；turn ID '+turn,mail))
+                    # Reserve exactly once before writing to stdout. A dead reader or
+                    # interrupted process leaves the letter available for manual review.
+                    state, detail = ('unknown', '监听输出待核对；turn ID ') if stream else ('notified', '同回合收件；turn ID ')
+                    db.execute('UPDATE mail SET state=?,detail=? WHERE id=?',(state,detail+turn,mail))
                     return {'status':'taken','id':mail,'thread':thread,'turn':turn,'text':row[0]}
                 else:
                     raise ValueError('unknown operation')
@@ -170,9 +172,13 @@ def follow(store,history,thread,turn):
         if notice['status']!='ready':
             print(json.dumps(notice),flush=True)
             return
-        letter=receive(store,history,'take',{'id':notice['id']},meta)
+        letter=receive(store,history,'take',{'id':notice['id']},meta,stream=True)
         if letter['status']=='taken':
             print(json.dumps(letter),flush=True)
+            with closing(connection(store,'rw')) as db, db:
+                db.execute("""UPDATE mail SET state='notified',detail=? WHERE id=?
+                    AND state='unknown' AND detail=?""",
+                    ('同回合收件；turn ID '+turn,letter['id'],'监听输出待核对；turn ID '+turn))
 
 
 if __name__=='__main__':

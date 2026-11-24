@@ -4,6 +4,8 @@
 
 ## 首次使用
 
+要核对本机准备情况，从工作台根目录在 PowerShell 运行 `& '.\双会话工作台.cmd' --doctor`。它检查 Python/Tk、CloudCLI Desktop 及服务包、两端会话索引、面板校验和支持 queue 的 Codex CLI。附加 `--project "项目目录"` 可检查该目录的收件 hook 配置；信任状态以 Codex 的 `/hooks` 为准。自检同时显示独立 Claude CLI 能发现的交互终端数。
+
 1. 在 **Codex Desktop** 和 **CloudCLI Desktop** 各完成一个测试回合。CloudCLI 的本地服务包须为 **1.37.9**，Claude 能正常回复即可。桥复用它的 Electron、Claude Agent SDK 和数据库驱动。Codex 需要支持 `queue --thread … --message …` 的 CLI，桥优先查找 Desktop 安装的版本，也支持 PATH 中的版本。已验证的 CLI 为 `0.171.0-alpha.13`。
 2. 准备 **Python 3（含 Tk，已测 3.14）**。将本仓库克隆或解压到一个可写的固定目录。ccbridge 的 Python 端使用标准库。TaskQuay、隧道、单独的 Node 服务均可省去。
 3. 等 CloudCLI 当前任务结束，正常退出它的普通本地服务。双击 **双会话工作台.cmd**，等首页显示服务就绪。如果已有服务占用端口，检查 CloudCLI 的 *Keep Local Server Running After Quit* 设置，再重新打开工作台。
@@ -27,6 +29,8 @@ codex mcp add daily_pair_inbox -- $python -B -X utf8 $inbox serve
 ```
 
 ## 发件与回执
+
+「消息记录」的详情会给出下一步，命令行查回执时对应 JSON 中的 `next_action`。例如原生入队后可以用原编号查询进展；发送或监听输出结果不明时，先核对原聊天。使用 `send --follow` 时，桥先为该回合保留唯一领取权，正文成功写入监听输出后才登记领取回执。输出中断会留下待核对记录，原信不会重复投递。
 
 在 CloudCLI Chat 中让 Claude 调用 `mcp__daily_pair__send` 可取得登记编号。也支持助手答复末行的 `ASTRA {"text":"正文"}`；同一运行中通过 steer 追加任务时，各次完成的答复分别登记。独立 Claude CLI 可以从配对项目目录运行 `py -3 <工作台>/daily/relay.py cc-send --binding <配对号> --native-cc <Claude原生ID> --id <本封UUID> --text-file 正文.txt`。正文文件使用 UTF-8，同一封重试沿用原 ID。
 
