@@ -102,18 +102,24 @@ def call(store, history_file, name, args, meta):
         return {'status': 'ended'}
 
 
-def serve(store, history, handler=call):
-    # One bounded outstanding watch. Other servers and the normal work tool
-    # remain independent. Only a foreground take returns a body.
-    for raw in sys.stdin.buffer:
-        req = {}
+def serve(store, history, handler=call, *, cancellable=False):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event, Lock
+
+    lock=Lock()
+    pending={}
+
+    def emit(frame):
+        with lock:
+            print(json.dumps(frame),flush=True)
+
+    def reply(req, stop=None):
         try:
-            req = json.loads(raw)
             if not isinstance(req, dict):
                 req = {}
                 raise ValueError('expected an MCP request object')
             if 'id' not in req:
-                continue
+                return
             method = req['method']
             params = req.get('params', {})
             if method == 'initialize':
@@ -130,15 +136,42 @@ def serve(store, history, handler=call):
                     for name, desc, props in [('watch','Wait for one paired letter for this turn.',{}),
                         ('take','Claim one noticed paired letter once.',{'id':{'type':'string'}})]]}
             elif method == 'tools/call':
-                value = handler(store, history, params['name'], params.get('arguments',{}), params['_meta'])
+                args = (store, history, params['name'], params.get('arguments',{}), params['_meta'])
+                value = handler(*args, cancelled=stop) if stop is not None else handler(*args)
                 result = {'content':[{'type':'text','text':json.dumps(value,ensure_ascii=False)}]}
             else:
-                print(json.dumps({'jsonrpc':'2.0','id':req['id'],'error':{'code':-32601,'message':'Unknown method'}}),flush=True)
-                continue
+                emit({'jsonrpc':'2.0','id':req['id'],'error':{'code':-32601,'message':'Unknown method'}})
+                return
             frame = {'result':result}
         except (ValueError, KeyError, TypeError, sqlite3.Error) as exc:
             frame = {'error':{'code':-32603,'message':str(exc)}}
-        print(json.dumps({'jsonrpc':'2.0','id':req.get('id'), **frame}), flush=True)
+        emit({'jsonrpc':'2.0','id':req.get('id'), **frame})
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        try:
+            for raw in sys.stdin.buffer:
+                try:
+                    req=json.loads(raw)
+                except ValueError:
+                    emit({'jsonrpc':'2.0','id':None,'error':{'code':-32700,'message':'Invalid JSON'}})
+                    continue
+                if not isinstance(req,dict):
+                    emit({'jsonrpc':'2.0','id':None,'error':{'code':-32600,'message':'Invalid request'}})
+                    continue
+                if cancellable and req.get('method')=='notifications/cancelled':
+                    item=pending.get(req.get('params',{}).get('requestId'))
+                    if item:
+                        item[0].set()
+                elif cancellable and req.get('method')=='tools/call' and 'id' in req:
+                    pending={i:v for i,v in pending.items() if not v[1].done()}
+                    stop=Event()
+                    pending[req['id']]=(stop,pool.submit(reply,req,stop))
+                else:
+                    reply(req)
+        finally:
+            for stop,_ in pending.values():
+                stop.set()
+
 
 
 if __name__ == '__main__':

@@ -22,8 +22,18 @@ export async function nativeQueue(threadId, message) {
 }
 
 const pairRule = '来信沿用用户已有授权；普通通知无需复述或回执。';
-const ccBrief = '配对约定：'+pairRule+'需要给 Astra 交付时，在答复末尾每封独占一行：ASTRA {"text":"结果"}。';
-const pairingBrief = readFileSync(new URL('./pairing-brief.md',import.meta.url),'utf8').trimEnd();
+const ccBrief = '配对约定：'+pairRule+'给 Astra 发单向信时调用 mcp__daily_pair__send，返回的编号可查回执。也兼容末行 ASTRA {"text":"结果"}。';
+const briefRoot = fileURLToPath(new URL('../',import.meta.url));
+function readPairingBrief(binding,recipient) {
+  const file=recipient==='cc' ? '配对分工-Claude.md' : '配对分工-Astra.md';
+  const project=binding[recipient+'_cwd'];
+  try {
+    return readFileSync(path.join(project,file),'utf8').trim();
+  } catch(error) {
+    if(error.code!=='ENOENT') throw error;
+    return readFileSync(path.join(briefRoot,file),'utf8').trim();
+  }
+}
 
 const uuid = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
 function shortText(text) {
@@ -61,6 +71,25 @@ function addressed(command) {
   return {mode:'none',text:shortText(match[2])};
 }
 
+// A model can leave prose quotation marks unescaped inside a text-only packet.
+// Keep JSON escapes (including newlines) and reject ambiguous field boundaries.
+export function parseOutboundPacket(raw, allowQuotedProse=false) {
+  try {return JSON.parse(raw);}
+  catch(error) {
+    const body=allowQuotedProse && /^\{\s*"text"\s*:\s*"([\s\S]*)"\s*\}$/.exec(raw.trim());
+    if(!body) throw error;
+    let repaired=false;
+    const escaped=body[1].replace(/\\[\s\S]|"/g,(part,offset,all)=>{
+      if(part!=='"') return part;
+      if(/^\s*[,}:\]]/.test(all.slice(offset+1))) throw error;
+      repaired=true;
+      return '\\"';
+    });
+    if(!repaired) throw error;
+    return {text:JSON.parse('"'+escaped+'"')};
+  }
+}
+
 function outbound(text, {allowProse=false}={}) {
   if(typeof text!=='string') return [];
   const lines=text.trimEnd().split(/\r?\n/);
@@ -81,25 +110,32 @@ function outbound(text, {allowProse=false}={}) {
     if(start>=0 || (!allowProse && line.trim())) return [];
   }
   if(fence || start<0) return [];
-  return lines.slice(start).map(line => {
-    const prefix=line.match(marker)[0];
-    const packet=JSON.parse(line.slice(prefix.length));
-    if(!packet || typeof packet!=='object' || Array.isArray(packet)) throw Error('ASTRA 需要 JSON 对象');
-    const {mode,reply_mode=mode===undefined ? 'none' : mode}=packet;
-    const legacy=prefix==='ASTRA-REPLY';
-    const key=legacy?'id':'reply_to';
-    if(Object.keys(packet).some(k=>!['text',key,'mode','reply_mode'].includes(k)))
-      throw Error('ASTRA 信件字段无效');
-    if(legacy || packet.reply_to!=null) {
-      if([mode,packet.reply_mode].some(m=>m!==undefined && m!=='none'))
-        throw Error('ASTRA 正式回信的 reply_mode 必须为 none');
-      return replyPacket(packet[key],packet.text);
-    }
-    if(mode!==undefined && mode!==reply_mode)
-      throw Error('ASTRA mode 与 reply_mode 冲突');
-    if(!['required','none','deferred'].includes(reply_mode)) throw Error('ASTRA reply_mode 无效');
-    return {mode:reply_mode,text:shortText(packet?.text)};
+  return lines.slice(start).map((line,index)=>{
+    try {return readOutboundLine(line,allowProse);}
+    catch(error) {throw Error('第 '+(index+1)+' 个信封（答复第 '+(start+index+1)+' 行）：'+error.message);}
   });
+}
+
+function readOutboundLine(line,allowProse) {
+  const prefix=line.startsWith('ASTRA-REPLY')?'ASTRA-REPLY':'ASTRA';
+  let packet;
+  try {packet=parseOutboundPacket(line.slice(prefix.length),allowProse && prefix==='ASTRA');}
+  catch(error) {throw Error('JSON 解析失败：'+error.message);}
+  if(!packet || typeof packet!=='object' || Array.isArray(packet)) throw Error('ASTRA 需要 JSON 对象');
+  const {mode,reply_mode=mode===undefined ? 'none' : mode}=packet;
+  const legacy=prefix==='ASTRA-REPLY';
+  const key=legacy?'id':'reply_to';
+  if(Object.keys(packet).some(k=>!['text',key,'mode','reply_mode'].includes(k)))
+    throw Error('ASTRA 信件字段无效');
+  if(legacy || packet.reply_to!=null) {
+    if([mode,packet.reply_mode].some(m=>m!==undefined && m!=='none'))
+      throw Error('ASTRA 正式回信的 reply_mode 必须为 none');
+    return replyPacket(packet[key],packet.text);
+  }
+  if(mode!==undefined && mode!==reply_mode)
+    throw Error('ASTRA mode 与 reply_mode 冲突');
+  if(!['required','none','deferred'].includes(reply_mode)) throw Error('ASTRA reply_mode 无效');
+  return {mode:reply_mode,text:shortText(packet?.text)};
 }
 
 // A provider can keep its writer open for background activity after the terminal event.
@@ -124,12 +160,22 @@ function observeTurn() {
   };
 }
 
-export function installWorker({db, desktopDb, sessions, provider, runtime, runRegistry, detached,
+export function installWorker({db, desktopDb, sessions, provider, runtime, runRegistry, detached, makeSendServer,
     query, python, storePath, desktopProvision, queue = nativeQueue, steer, nativeBacklog,
     externalBusy = async () => false, defaultUserId = () => null, notify = console.error}) {
   db.pragma('foreign_keys = ON');
   db.pragma('busy_timeout = 5000');
   db.exec(readFileSync(new URL('./pairing-notices.sql',import.meta.url),'utf8'));
+  db.exec(readFileSync(new URL('./auto-delivery.sql',import.meta.url),'utf8'));
+  db.exec(readFileSync(new URL('./receipts.sql',import.meta.url),'utf8'));
+  db.exec(`CREATE TRIGGER IF NOT EXISTS delivery_failure_feedback AFTER UPDATE OF state ON mail
+    WHEN OLD.state IN ('submitting','returning') AND NEW.state IN ('failed','unknown') BEGIN
+      INSERT OR IGNORE INTO send_feedback(id,binding_id,sender,related_id,reason)
+      VALUES('delivery:'||NEW.id||':'||OLD.state,NEW.binding_id,
+        CASE WHEN OLD.state='submitting' THEN NEW.source WHEN NEW.source='cc' THEN 'desktop' ELSE 'cc' END,NEW.id,
+        CASE WHEN NEW.state='unknown' THEN '提交结果待核对，请勿重发。' ELSE '投递失败。' END||coalesce(NEW.detail,''));
+    END;`);
+  db.exec("UPDATE send_feedback SET state='unknown',result='服务在提醒期间退出，请核对原会话' WHERE state='sending'");
   db.exec(`CREATE TABLE IF NOT EXISTS receiver (
     binding_id INTEGER PRIMARY KEY REFERENCES bindings(id), user_id INTEGER NOT NULL, options TEXT NOT NULL,
     introduction TEXT NOT NULL DEFAULT 'queued');
@@ -153,6 +199,9 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
       BEGIN INSERT INTO paired_submissions VALUES(NEW.id); END;
     UPDATE mail SET state='unknown',detail='服务在提交期间退出，请核对目标聊天' WHERE state IN ('submitting','returning');
     UPDATE receiver SET introduction='unknown' WHERE introduction='sending';`);
+  db.exec(`CREATE TABLE IF NOT EXISTS cc_output_receipts(
+    binding_id INTEGER NOT NULL REFERENCES bindings(id), source_key TEXT NOT NULL,
+    digest TEXT NOT NULL, ids TEXT NOT NULL, PRIMARY KEY(binding_id,source_key))`);
   const active = db.prepare('SELECT * FROM bindings WHERE active=1 AND cc=?');
   const getReceiver = db.prepare('SELECT * FROM receiver WHERE binding_id=?');
   // Completed inbound turns from older bridge versions already carried the protocol.
@@ -213,7 +262,24 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
     return row && !row.archived && samePath(row.cwd,binding.desktop_cwd);
   }
   const inboxRoute=db.prepare('SELECT CASE WHEN listen_until>=unixepoch() THEN turn END AS turn FROM paired_inboxes WHERE binding_id=?');
+  const autoInbox=db.prepare('SELECT 1 FROM auto_inboxes WHERE binding_id=?');
+  const listener=db.prepare('SELECT turn FROM auto_inboxes WHERE binding_id=? AND watch_id IS NOT NULL AND expires_ms>?');
+  const hasAutoOffer=db.prepare('SELECT 1 FROM auto_offers WHERE mail_id=? UNION ALL SELECT 1 FROM burst_offers WHERE mail_id=? LIMIT 1');
+  const rejectWrongTurn=db.prepare('DELETE FROM auto_offers WHERE mail_id=? AND turn<>?');
+  const rejectWrongBurst=db.prepare('DELETE FROM burst_offers WHERE mail_id=? AND turn<>?');
+  function senderRoute(id) {
+    return autoInbox.get(id) ? listener.get(id,Date.now()) : inboxRoute.get(id);
+  }
   const holdLetter=db.prepare('INSERT INTO paired_letters(mail_id,target_turn) VALUES(?,?)');
+  const addFeedback=db.prepare(`INSERT INTO send_feedback(id,binding_id,sender,reason,related_id,correction,state)
+    VALUES(?,?,'cc',?,?,?,?)`);
+  function rejectPacket(binding,error,{related=null,correct=false,shown=false,output=''}={}) {
+    const preview=output.split(/\r?\n/).find(line=>/^ASTRA(?:-REPLY)?\s/.test(line));
+    const reason=String(error.message).slice(0,1200)+(preview?'\n出站片段：'+preview.slice(0,120):'');
+    const id=randomUUID();
+    addFeedback.run(id,binding.id,reason,related,Number(correct),shown?'shown':'queued');
+    return '未发出（未登记信件） · '+reason+' · 错误编号 '+id;
+  }
   const enqueue = db.transaction((binding, packets, route) => {
     if (active.get(binding.cc)?.id!==binding.id)
       throw Error('本回合期间配对已变，信件未投递 '+packets.filter(p=>p.id).map(p=>p.id).join('、'));
@@ -229,16 +295,109 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
       }
       const id=randomUUID();
       addMail.run(id,binding.id,packet.text,packet.mode);
-      if(packet.mode==='none' && (route || inboxRoute.get(binding.id))) {
-        holdLetter.run(id,route?.turn ?? null);
-        set.run('unknown','配对收件箱待领取',id,'queued');
+      if(packet.mode==='none') {
+        // The trigger offers only to the watch present at insertion. The
+        // receiver checks native turn status before accepting the offer.
+        if(autoInbox.get(binding.id)) {
+          if(route?.turn) {
+            rejectWrongTurn.run(id,route.turn);
+            rejectWrongBurst.run(id,route.turn);
+          }
+        } else if(route || inboxRoute.get(binding.id)) {
+          holdLetter.run(id,route?.turn ?? null);
+          set.run('unknown','配对收件箱待领取',id,'queued');
+        }
       }
       return id;
     });
   });
 
+  function registerFinal(binding,result,route,related=null) {
+    if(result.sdkHandled) return;
+    try {
+      const packets=outbound(result.finalText,{allowProse:true});
+      if(related && packets.some(p=>p.mode!=='none')) throw Error('单向来信回合只能另发单向信');
+      if(packets.length) return enqueue(binding,packets,route);
+    } catch(error) {
+      notify(rejectPacket(binding,error,{related,correct:true,output:result.finalText}));
+    }
+  }
+
   // Match only the exact detached writer to suppress re-forwarding an incoming message.
-  const detachedWriters = new WeakSet();
+  const detachedWriters = new WeakMap();
+  const lookupOutput=db.prepare('SELECT digest,ids FROM cc_output_receipts WHERE binding_id=? AND source_key=?');
+  const saveOutput=db.prepare('INSERT INTO cc_output_receipts VALUES(?,?,?,?)');
+  const registerOutput=db.transaction((binding,key,packets,route)=>{
+    const digest=createHash('sha256').update(JSON.stringify(packets)).digest('hex');
+    const prior=lookupOutput.get(binding.id,key);
+    if(prior) {
+      if(prior.digest!==digest) throw Error('重复的来源编号对应不同的信件');
+      return JSON.parse(prior.ids);
+    }
+    const ids=enqueue(binding,packets,route);
+    saveOutput.run(binding.id,key,digest,JSON.stringify(ids));
+    return ids;
+  });
+
+  // A CloudCLI run can contain several SDK turns when the user steers CC.
+  // Their individual successful results arrive before the single UI completion.
+  function sendingContext(context,binding,scope,writer) {
+    let messageId, blocks=new Map(), skip=scope.skipFirst, closed=false;
+    const sentByTool=new Set();
+    function finish(text) {
+      if(!messageId || closed) return;
+      closed=true;
+      scope.handled=true;
+      if(skip) {skip=false;return;}
+      let ids;
+      try {
+        const packets=outbound(text,{allowProse:true}).filter(p=>p.id || p.mode!=='none' || !sentByTool.has(p.text));
+        if(scope.related && packets.some(p=>p.mode!=='none')) throw Error('单向来信回合只能另发单向信');
+        if(packets.length) ids=registerOutput.immediate(binding,'assistant:'+messageId,packets,scope.route);
+      } catch(error) {
+        notify(rejectPacket(binding,error,{related:scope.related,correct:true,output:text}));
+      }
+      if(ids) {
+        try {writer.send({kind:'status',provider:'claude',sessionId:binding.cc,text:'已登记 · '+ids.join('、')});}
+        catch {notify('信件已登记，界面状态未确认',ids.join('、'));}
+      }
+    }
+    const wrapped={...context};
+    if(context.normalizeMessage) wrapped.normalizeMessage=(raw,sid)=>{
+      const events=context.normalizeMessage(raw,sid);
+      if(scope.done || raw.session_id!==binding.native_cc || raw.parent_tool_use_id || raw.parentToolUseId) return events;
+      if(raw.type==='assistant' && raw.message?.id && !raw.isReplay && !raw.error &&
+          raw.message.model!=='<synthetic>' && raw.message.role==='assistant') {
+        if(messageId!==raw.message.id) {
+          messageId=raw.message.id;blocks=new Map();closed=false;scope.handled=false;
+        }
+        if(raw.uuid && Array.isArray(raw.message.content))
+          blocks.set(raw.uuid,raw.message.content.filter(p=>p.type==='text').map(p=>p.text).join('\n'));
+        if(raw.message.stop_reason==='end_turn') finish([...blocks.values()].filter(Boolean).join('\n'));
+      } else if(raw.type==='result') {
+        if(raw.subtype==='success' && !raw.is_error && typeof raw.result==='string') finish(raw.result);
+        else scope.handled=true;
+        sentByTool.clear();
+      }
+      return events;
+    };
+    const create=context.createQuery ?? query;
+    if(makeSendServer && create) wrapped.createQuery=request=>{
+      const instance=randomUUID();
+      const server=makeSendServer((body,requestId)=>{
+        if(scope.done || !validCC(binding) || active.get(binding.cc)?.id!==binding.id)
+          throw Error('配对或本次发件会话已结束');
+        if(skip) throw Error('原信已登记，使用原信回执');
+        const text=shortText(body);
+        const ids=registerOutput.immediate(binding,'tool:'+instance+':'+requestId,[{text,mode:'none'}],senderRoute(binding.id));
+        sentByTool.add(text);
+        return ids[0];
+      });
+      if(request.options?.mcpServers?.daily_pair) return create(request);
+      return create({...request,options:{...request.options,mcpServers:{...request.options?.mcpServers,daily_pair:server}}});
+    };
+    return wrapped;
+  }
   const previous = provider.run.bind(provider);
   provider.run = async (command,opts,writer,context) => {
     if (desktopProvision && !detachedWriters.has(writer) && [createDesktop,cancelDesktop].includes(command?.trim?.())) {
@@ -246,20 +405,23 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
       return previous('【工作台配对结果】'+status+' 请只向用户转达这项结果。',opts,writer,context);
     }
     const binding = active.get(opts.sessionId);
-    if (!binding || !validCC(binding) || !samePath(opts.cwd,binding.cc_cwd) ||
-        !Number.isInteger(writer.userId) || detachedWriters.has(writer))
+    if (!binding || !validCC(binding) || !samePath(opts.cwd,binding.cc_cwd) || !Number.isInteger(writer.userId))
       return previous(command,opts,writer,context);
+    if(detachedWriters.has(writer)) {
+      const scope=detachedWriters.get(writer);
+      return previous(command,opts,writer,scope ? sendingContext(context,binding,scope,writer) : context);
+    }
     const settings = Object.fromEntries(['model','effort','permissionMode','toolsSettings']
       .filter(k=>opts[k]!==undefined).map(k=>[k,opts[k]]));
     recordReceiver.run(binding.id,writer.userId,JSON.stringify(settings));
     const observe=observeTurn();
-    const route=inboxRoute.get(binding.id);
+    const route=senderRoute(binding.id);
     const needsBrief=!briefed.get({binding:binding.id});
     let direct, prompt=command, deliveryError, completed=false;
     const send = writer.send;
-    function report(error) {
+    function report(error,modelOutput='') {
       send.call(writer,{kind:'error',provider:'claude',sessionId:opts.sessionId,
-        content:'配对桥未投递：'+error.message});
+        content:rejectPacket(binding,error,{correct:!!modelOutput,shown:!modelOutput,output:modelOutput||command})});
     }
     try {
       const packet=addressed(command);
@@ -273,45 +435,57 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
       report(error);
       throw error;
     }
+    const scope={route,skipFirst:!!direct.length};
     writer.send = function(event) {
+      if(event.kind==='complete' && !event.parentToolUseId) scope.done=true;
       const final=observe(event);
       if(final) completed=true;
-      if(final && !direct.length) {
+      if(final && !direct.length && !scope.handled) {
         try {
           const messages=outbound(final.text,{allowProse:true});
-          if(messages.length) enqueue(binding,messages,route);
+          if(messages.length) {
+            const ids=enqueue(binding,messages,route);
+            try {send.call(this,{kind:'status',provider:'claude',sessionId:binding.cc,text:'已登记 · '+ids.join('、')});}
+            catch {notify('信件已登记，界面状态未确认',ids.join('、'));}
+          }
         } catch(error) {
           deliveryError=error;
-          report(error);
+          report(error,final.text);
         }
       }
       return send.call(this,event);
     };
     try {
-      const result=await previous(prompt,opts,writer,{...context,createQuery:context.createQuery ?? query});
+      const result=await previous(prompt,opts,writer,sendingContext({...context,createQuery:context.createQuery ?? query},binding,scope,writer));
       if(needsBrief && completed) recordBrief.run(binding.id);
       if(deliveryError) throw deliveryError;
       return result;
-    } finally { writer.send=send; }
+    } finally { scope.done=true;writer.send=send; }
   };
 
-  async function ccTurn(binding,receiver,prompt) {
-    let final;
+  async function ccTurn(binding,receiver,prompt,scope=null) {
+    let final,showStatus;
     const observe=observeTurn();
     const observed=Object.create(runtime);
     observed.run = async (name,cmd,opts,writer)=>{
-      detachedWriters.add(writer);
+      detachedWriters.set(writer,scope);
       const send=writer.send;
+      showStatus=text=>send.call(writer,{kind:'status',provider:'claude',sessionId:binding.cc,text});
       writer.send=function(e) {
+        if(scope && e.kind==='complete' && !e.parentToolUseId) scope.done=true;
         final ??= observe(e);
         return send.call(this,e);
       };
       try {return await runtime.run(name,cmd,opts,writer);}
-      finally {writer.send=send; detachedWriters.delete(writer);}
+      finally {if(scope) scope.done=true;writer.send=send; detachedWriters.delete(writer);}
     };
     const result=await detached({sessionId:binding.cc,userId:receiver.user_id,content:prompt,
       options:JSON.parse(receiver.options),interruptActiveRun:false},{runtime:observed});
-    return {...result,complete:!!final,finalText:final?.text};
+    return {...result,complete:!!final,finalText:final?.text,sdkHandled:scope?.handled,registered(ids) {
+      if(!ids?.length) return;
+      try {showStatus?.('已登记 · '+ids.join('、'));}
+      catch {notify('信件已登记，界面状态未确认',ids.join('、'));}
+    }};
   }
 
   async function deliver(binding,mail,receiver) {
@@ -321,7 +495,11 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
     if(!toDesktop && (!receiver || runRegistry.isProcessing(binding.cc) ||
         runtime.hasBackgroundWork(binding.cc) || await externalBusy(binding.cc))) return 'busy';
     // A rebinding and a claim are serialized by SQLite. Only the winner may send.
-    if(toDesktop && initial && mail.reply_mode==='none' && nativeBacklog && !steer) {
+    const auto=toDesktop && initial && mail.reply_mode==='none' && !!autoInbox.get(binding.id);
+    // The original watch/handoff wins if the arrival matched it. Otherwise a
+    // trusted project hook can receive a letter even on an automatic binding.
+    if(toDesktop && initial && mail.reply_mode==='none' && nativeBacklog && !steer &&
+        !(auto && hasAutoOffer.get(mail.id,mail.id))) {
       if(!claimNotification.immediate(binding,mail)) return;
     } else {
       const claim=toDesktop && !initial ? claimDesktopReturn.run(mail.id) : set.run(claimed,null,mail.id,mail.state);
@@ -344,7 +522,7 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
           prompt='Claude 来信\n'+envelope+'\n'+action;
         }
         invoked=true;
-        const turnId=initial && mail.reply_mode==='none' && steer ? await steer(binding,mail,prompt,
+        const turnId=!auto && initial && mail.reply_mode==='none' && steer ? await steer(binding,mail,prompt,
           cwd=>samePath(cwd,binding.desktop_cwd) && !!stillClaimed.get(mail.id,claimed) &&
             nativeBacklog(binding.desktop)===false) : null;
         if (turnId) {
@@ -366,22 +544,22 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
           +'也可由用户稍后输入「回复 Desktop '+mail.id+'：最终答复」。';
         else content='配对 Desktop 来信，请直接用自然语言回答对方的问题，回复由桥递送。';
         invoked=true;
-        const route=inboxRoute.get(binding.id);
+        const route=senderRoute(binding.id);
         if(!notification) content+='\n'+envelope;
         const needsBrief=!briefed.get({binding:binding.id});
         if(needsBrief) content+='\n\n'+ccBrief;
-        const r=await ccTurn(binding,receiver,content);
+        const r=await ccTurn(binding,receiver,content,initial && mail.reply_mode==='none' ? {route,related:mail.id} : null);
         if(!r.started && r.error===busyError) {set.run(mail.state,'等待 CC 空闲',mail.id,claimed);return 'busy';}
         if(!r.started) {set.run('failed',r.error || 'CC 回合未启动',mail.id,claimed);return;}
         if(r.error || !r.complete) throw Error(r.error || 'CC 回合完成情况未确认');
         if(needsBrief) recordBrief.run(binding.id);
         if(!initial) set.run('returned','CC 回合已完成',mail.id,claimed);
         else if(mail.reply_mode==='none') {
-          db.transaction(() => {
+          const ids=db.transaction(() => {
             if (!set.run('notified','CC 单向消息回合已完成',mail.id,claimed).changes) return;
-            const packets=outbound(r.finalText,{allowProse:true});
-            if (packets.length && packets.every(p => p.mode==='none')) enqueue(binding,packets,route);
+            return registerFinal(binding,r,route,mail.id);
           }).immediate();
+          r.registered(ids);
         }
         else if(mail.reply_mode==='deferred') {
           let detail='CC 回合已完成，等待显式回信';
@@ -396,6 +574,7 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
             }
           } catch(error) {
             detail+='（'+mail.id+' 未投递：'+error.message+'）';
+            rejectPacket(binding,error,{related:mail.id,correct:true,output:r.finalText});
             notify(detail);
           }
           set.run('awaiting_reply',detail,mail.id,claimed);
@@ -409,6 +588,70 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
     }
   }
   const working=new Set();
+  const pendingFeedback=db.prepare("SELECT * FROM send_feedback WHERE binding_id=? AND sender=? AND state='queued' ORDER BY rowid LIMIT 1");
+  const feedbackState=db.prepare('UPDATE send_feedback SET state=?,result=? WHERE id=? AND state=?');
+  async function sendFeedback(binding,receipt,receiver) {
+    if(!validCC(binding) || !validDesktop(binding)) return;
+    if(receipt.correction && receipt.related_id) {
+      const original=db.prepare('SELECT state,reply_mode FROM mail WHERE id=? AND binding_id=?')
+        .get(receipt.related_id,binding.id);
+      if(!original || original.state==='cancelled' ||
+          (original.reply_mode==='deferred' && original.state!=='awaiting_reply')) {
+        feedbackState.run('shown','原信已关闭或已有答复，免去修正提醒',receipt.id,'queued');
+        return;
+      }
+    }
+    if(receipt.sender==='cc' && (!receiver || runRegistry.isProcessing(binding.cc) ||
+        runtime.hasBackgroundWork(binding.cc) || await externalBusy(binding.cc))) return;
+    if(!feedbackState.run('sending',null,receipt.id,'queued').changes) return;
+    const transport=receipt.id.startsWith('delivery:');
+    const header=transport?'信件 '+receipt.related_id:'未发出：上一批信封没有登记';
+    const instruction=receipt.correction?'请核对这次失败的信封。若任务仍有效，可修正后在末行重新发出；已成功登记的信无需重发。':'请核对原记录。';
+    const prompt='【工作台失败回执】'+header+'。'+receipt.reason+
+      (!transport && receipt.related_id?'\n关联原信 '+receipt.related_id:'')+'\n'+instruction;
+    try {
+      if(receipt.sender==='desktop') {
+        await queue(binding.desktop,prompt);
+        feedbackState.run('shown','失败提醒已入队',receipt.id,'sending');
+        return;
+      }
+      const route=senderRoute(binding.id);
+      const r=await ccTurn(binding,receiver,prompt);
+      if(!r.started && r.error===busyError) {feedbackState.run('queued',null,receipt.id,'sending');return;}
+      if(!r.started || r.error || !r.complete) throw Error(r.error || '失败提醒回执不明');
+      db.transaction(()=>{
+        let result='发件方已收到失败提醒';
+        if(receipt.correction) {
+          try {
+            const packets=outbound(r.finalText,{allowProse:true});
+            if(packets.length) {
+              if(receipt.related_id) {
+                const original=db.prepare('SELECT reply_mode,state FROM mail WHERE id=? AND binding_id=?').get(receipt.related_id,binding.id);
+                if(original?.reply_mode==='deferred' && (original.state!=='awaiting_reply' ||
+                   packets.length!==1 || packets[0].id!==receipt.related_id)) throw Error('原异步信状态或回信编号不匹配');
+                if(original?.reply_mode==='none' && packets.some(p=>p.mode!=='none')) throw Error('本次只接受独立单向信');
+              }
+              // A human may already have repaired this batch while the model was busy.
+              const registered=db.prepare(`SELECT id FROM mail WHERE binding_id=? AND source='cc'
+                AND created>=? AND body=? AND reply_mode=? ORDER BY seq`);
+              const recent=new Map();
+              const ids=db.transaction(()=>packets.map(packet=>{
+                if(!packet.id) {
+                  const key=JSON.stringify([packet.mode,packet.text]);
+                  if(!recent.has(key)) recent.set(key,registered.all(binding.id,receipt.created,packet.text,packet.mode));
+                  const prior=recent.get(key).shift();
+                  if(prior) return prior.id;
+                }
+                return enqueue(binding,[packet],route)[0];
+              })).immediate();
+              result='修正后已登记 · '+ids.join('、');
+            }
+          } catch(error) {result='修正仍未发出 · '+error.message;notify(result);}
+        }
+        feedbackState.run('shown',result,receipt.id,'sending');
+      }).immediate();
+    } catch(error) {feedbackState.run('unknown',String(error.message),receipt.id,'sending');}
+  }
   async function sendNotice(binding,recipient,receiver) {
     if(!validCC(binding) || !validDesktop(binding)) return;
     if(recipient==='cc') {
@@ -424,20 +667,30 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
         receiver=getReceiver.get(binding.id);
       }
     }
+    const brief=readPairingBrief(binding,recipient);
     if(!claimNotice.run(binding.id,recipient).changes) return;
     try {
       if(recipient==='cc') {
-        const result=await ccTurn(binding,receiver,pairingBrief+'\n\n'+ccBrief);
+        const route=senderRoute(binding.id);
+        const result=await ccTurn(binding,receiver,[brief,ccBrief].filter(Boolean).join('\n\n'),{route});
         if(!result.started && result.error===busyError) {
           finishNotice.run('queued',null,binding.id,recipient);
           return;
         }
         if(!result.started || result.error || !result.complete) throw Error(result.error || 'Claude 回合完成情况未确认');
+        const ids=db.transaction(()=>{
+          if(!finishNotice.run('sent',null,binding.id,recipient).changes) return;
+          return registerFinal(binding,result,route);
+        }).immediate();
+        result.registered(ids);
+        return;
       } else {
-        await queue(binding.desktop,pairingBrief+'\n\n'+introduction(binding));
+        const listen=autoInbox.get(binding.id) ? '\n平时继续做手头的事，项目收件 hook 会在工具结束时提示取件。若本回合的下一步依赖 Claude 的回复，发信时用 relay.py send --follow，在后台读取同一进程的后续输出并 notify，直到回合结束。' : '';
+        await queue(binding.desktop,[brief,introduction(binding)+listen].filter(Boolean).join('\n\n'));
+        if(listen) db.prepare('UPDATE auto_inboxes SET hint_pending=0 WHERE binding_id=?').run(binding.id);
       }
       finishNotice.run('sent',null,binding.id,recipient);
-      if(recipient==='desktop') setIntro.run('sent',binding.id,'queued');
+      setIntro.run('sent',binding.id,'queued');
     } catch(error) {
       finishNotice.run('unknown',String(error.message).slice(0,1500),binding.id,recipient);
       notify('配对分工投递未确认',binding.id,recipient,error.message);
@@ -464,7 +717,12 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
       }
       if(notice?.state==='sending') return;
       const mail=head.get(binding.id,source,0);
-      if(!notice && source==='cc' && receiver?.introduction==='queued' && !mail && !inboxRoute.get(binding.id) && validDesktop(binding) &&
+      const feedback=pendingFeedback.get(binding.id,recipient);
+      if(feedback && (!mail || !['queued','received'].includes(mail.state))) {
+        await sendFeedback(binding,feedback,receiver);
+        return;
+      }
+      if(!notice && source==='cc' && receiver?.introduction==='queued' && !mail && !autoInbox.get(binding.id) && !inboxRoute.get(binding.id) && validDesktop(binding) &&
          setIntro.run('sending',binding.id,'queued').changes) {
         try {
           await queue(binding.desktop,introduction(binding)+' 这是一次性联通说明，仅需在本聊天确认就绪。');

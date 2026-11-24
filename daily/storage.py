@@ -110,7 +110,8 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self._connect()) as db, db:
             notices = Path(__file__).with_name("pairing-notices.sql").read_text(encoding="utf-8")
-            db.executescript("BEGIN IMMEDIATE;\n" + BINDINGS_SCHEMA + notices)
+            receipts = Path(__file__).with_name("receipts.sql").read_text(encoding="utf-8")
+            db.executescript("BEGIN IMMEDIATE;\n" + BINDINGS_SCHEMA + notices + receipts)
             columns = {row["name"] for row in db.execute("PRAGMA table_info(mail)")}
             if not columns:
                 db.execute(MAIL_TABLE.format(table="mail"))
@@ -126,10 +127,18 @@ class Store:
                     SET seq = (SELECT max(seq) FROM sqlite_sequence WHERE name IN ('mail', 'mail_new'))
                     WHERE name='mail_new'
                 """)
+                db.execute("DROP TRIGGER IF EXISTS attach_pending_to_watch")
                 db.execute("DROP TABLE mail")
                 db.execute("ALTER TABLE mail_new RENAME TO mail")
             for statement in INDEXES_AND_TRIGGERS:
                 db.execute(statement)
+            # Keep migration and trigger installation in this same transaction.
+            sql = ""
+            for line in Path(__file__).with_name("auto-delivery.sql").read_text(encoding="utf-8").splitlines(True):
+                sql += line
+                if sqlite3.complete_statement(sql):
+                    db.execute(sql)
+                    sql = ""
 
     def _connect(self):
         db = sqlite3.connect(self.path, timeout=10, isolation_level=None)
@@ -149,6 +158,16 @@ class Store:
         with closing(self._connect()) as db:
             return [dict(r) for r in db.execute(f"SELECT {BINDING_FIELDS} FROM bindings{where} ORDER BY id")]
 
+    @contextmanager
+    def unpaired_project(self, project):
+        """Serialize a last-pair settings update with new bindings, including other panels."""
+        project = Path(project).resolve(strict=True)
+        with self._write() as db:
+            if any(Path(row[0]).resolve() == project for row in db.execute(
+                    "SELECT DISTINCT desktop_cwd FROM bindings WHERE active=1")):
+                raise ValueError("该目录已有活动配对，仍需保留项目收件。")
+            yield
+
     def messages(self):
         with closing(self._connect()) as db:
             return [dict(r) for r in db.execute("""
@@ -156,6 +175,16 @@ class Store:
                        b.cc,b.desktop,b.cc_title,b.desktop_title
                 FROM mail m JOIN bindings b ON b.id=m.binding_id ORDER BY m.seq
             """)]
+
+    def receipts(self, history_path, only_id=None):
+        if __package__:
+            from .receipts import enrich
+        else:
+            from receipts import enrich
+        rows=self.messages()
+        if only_id:
+            rows=[m for m in rows if m['id']==only_id]
+        return enrich(self,history_path,rows,only_id)
 
     @staticmethod
     def _retire(db, binding_id):
@@ -208,7 +237,8 @@ class Store:
             raise ValueError("Desktop thread has no active binding")
         return row["id"]
 
-    def desktop_send(self, thread_id, text, request_id, reply_mode=None, *, expected_binding=None):
+    def desktop_send(self, thread_id, text, request_id, reply_mode=None, *, expected_binding=None,
+                     handoff_turn=None, prefer_hook=False):
         """Enqueue a Desktop-origin letter once. Return its canonical request UUID."""
         request_id = _uuid(request_id, "request_id")
         _text(text, "body")
@@ -223,6 +253,16 @@ class Store:
             row = db.execute("SELECT binding_id, source, body, reply_mode FROM mail WHERE id = ?",
                              (request_id,)).fetchone()
             if row is None:
+                if prefer_hook and handoff_turn and db.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='inbox_tool_turns'").fetchone():
+                    if db.execute("""SELECT 1 FROM inbox_tool_turns WHERE binding_id=? AND turn_id=?
+                                     AND seen_at>unixepoch()-60""", (binding_id, handoff_turn)).fetchone():
+                        handoff_turn = None
+                if handoff_turn and reply_mode in (None,'none'):
+                    db.execute("""INSERT INTO turn_handoffs(binding_id,turn,expires_ms)
+                        SELECT binding_id,?,(unixepoch()+45)*1000 FROM auto_inboxes WHERE binding_id=?
+                        ON CONFLICT(binding_id) DO UPDATE SET turn=excluded.turn,expires_ms=excluded.expires_ms""",
+                               (_uuid(handoff_turn,'turn'),binding_id))
                 db.execute("INSERT INTO mail(id, binding_id, source, body, reply_mode) VALUES (?, ?, 'desktop', ?, ?)",
                            (request_id, binding_id, text, reply_mode or "none"))
             elif tuple(row) != (binding_id, "desktop", text, reply_mode or row["reply_mode"]):
@@ -252,6 +292,32 @@ class Store:
             else:
                 raise ValueError(f"Cannot accept first reply in state {row['state']}")
         return mail_id
+
+    def cc_send(self,binding,cc,native,text,request_id):
+        """Explicit local CLI submission, idempotent per immutable envelope."""
+        request_id=_uuid(request_id,'mail ID')
+        _text(text,'body')
+        if len(text)>2500:
+            raise ValueError('单封信最多 2500 字')
+        with self._write() as db:
+            if not db.execute('SELECT 1 FROM bindings WHERE id=? AND cc=? AND native_cc=? AND active=1',
+                              (binding,cc,native)).fetchone():
+                raise ValueError('Claude 配对已变更')
+            prior=db.execute('SELECT binding_id,source,body,reply_mode FROM mail WHERE id=?',(request_id,)).fetchone()
+            if prior is not None:
+                if tuple(prior)!=(binding,'cc',text,'none'):
+                    raise ValueError('该编号已用于另一封信')
+                return request_id
+            db.execute("INSERT INTO mail(id,binding_id,source,body,reply_mode) VALUES(?,?,'cc',?,'none')",
+                       (request_id,binding,text))
+            if (not db.execute('SELECT 1 FROM auto_inboxes WHERE binding_id=?',(binding,)).fetchone()
+                    and db.execute("SELECT 1 FROM sqlite_master WHERE name='paired_inboxes'").fetchone()):
+                route=db.execute('SELECT CASE WHEN listen_until>=unixepoch() THEN turn END FROM paired_inboxes WHERE binding_id=?',
+                                 (binding,)).fetchone()
+                if route:
+                    db.execute('INSERT INTO paired_letters(mail_id,target_turn) VALUES(?,?)',(request_id,route[0]))
+                    db.execute("UPDATE mail SET state='unknown',detail='配对收件箱待领取' WHERE id=?",(request_id,))
+        return request_id
 
     def desktop_confirm(self, thread_id, id):
         """Confirm that the initiating Desktop thread received the CC reply."""

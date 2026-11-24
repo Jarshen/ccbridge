@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 import json
 import os
 from pathlib import Path
@@ -35,6 +36,50 @@ class StorageTests(unittest.TestCase):
             INSERT INTO mail(id,binding_id,source,body,state,reply_mode) VALUES (?,?,'cc','hi',?,?)
         """, (mail_id, self.binding, state, reply_mode))
         return mail_id
+
+    def test_plain_send_uses_active_project_hook_and_follow_reserves_turn(self):
+        turn = str(uuid4())
+        self.worker.execute("CREATE TABLE inbox_tool_turns(binding_id,turn_id,seen_at)")
+        self.worker.execute("INSERT INTO inbox_tool_turns VALUES(?,?,unixepoch())", (self.binding, turn))
+        self.store.desktop_send(self.thread, "progress", str(uuid4()), handoff_turn=turn, prefer_hook=True)
+        self.assertIsNone(self.worker.execute("SELECT turn FROM turn_handoffs").fetchone())
+        self.store.desktop_send(self.thread, "need a decision", str(uuid4()), handoff_turn=turn)
+        self.assertEqual(self.worker.execute("SELECT turn FROM turn_handoffs").fetchone(), (turn,))
+
+    def test_receipt_needs_matching_thread_id_and_entire_native_body(self):
+        mail=self.incoming("queued","none")
+        history=self.path.with_name("thread_history_1.sqlite")
+        def stage():
+            return self.store.receipts(history,mail)[0]['receipt']
+        self.assertEqual(stage(),'registered')
+        self.worker.execute("UPDATE mail SET state='notified',detail='Desktop 原生队列已接收，未确认已读。' WHERE id=?",(mail,))
+        self.assertEqual(stage(),'native_queued')
+        body=self.store.messages()[0]['body']
+        text=f'Claude〔{mail}〕\n'+body
+        def item(s):
+            return json.dumps({'type':'userMessage','content':[{'type':'text','text':s}]},ensure_ascii=False)
+        with closing(sqlite3.connect(history,isolation_level=None)) as native:
+            native.execute('CREATE TABLE thread_items(thread_id,turn_id,item_type,item_json)')
+            native.executemany("INSERT INTO thread_items VALUES(?,?,'userMessage',?)",[
+                ('other','wrong',item(text)),(self.thread,'wrong',item('quote: '+text)),
+                (self.thread,'wrong',item(text+' extra'))])
+            self.assertEqual(stage(),'native_queued')
+            native.execute("INSERT INTO thread_items VALUES(?,?,'userMessage',?)",(self.thread,'correct',item(text+'\n')))
+            self.assertEqual(stage(),'delivered')
+        history.unlink()
+        self.assertIn('correct',self.store.receipts(history,mail)[0]['receipt_evidence'])
+        self.assertEqual(self.store.messages()[0]['state'],'notified')
+
+    def test_explicit_cc_cli_submission_has_one_id_and_checks_binding(self):
+        mid=str(uuid4())
+        args=(self.binding,self.cc['id'],self.cc['native_id'],'review',mid)
+        self.assertEqual(self.store.cc_send(*args),mid)
+        self.assertEqual(self.store.cc_send(*args),mid)
+        with self.assertRaises(ValueError):
+            self.store.cc_send(self.binding,self.cc['id'],self.cc['native_id'],'different body',mid)
+        with self.assertRaises(ValueError):
+            self.store.cc_send(self.binding,self.cc['id'],str(uuid4()),'review',str(uuid4()))
+        self.assertEqual([m['id'] for m in self.store.messages()],[mid])
 
     def test_migrate_legacy_mail_including_retired_routes(self):
         self.worker.executescript("""

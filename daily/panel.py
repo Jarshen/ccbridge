@@ -10,10 +10,15 @@ import os
 from pathlib import Path
 import time
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
 from urllib.parse import quote, urlsplit
 import webbrowser
 from uuid import UUID
+
+if __package__:
+    from . import project_hooks
+else:
+    import project_hooks
 
 
 OFFLINE = "可先保存配对。请从日常启动入口启动带桥服务。启动前请先关闭普通 CloudCLI 服务，待桥服务就绪后再试用。"
@@ -24,13 +29,13 @@ STATES = {
     "submitted": "已提交", "received": "已接收", "running": "处理中",
     "returning": "回传中", "returned": "已回传", "delivered": "已送达",
     "completed": "已完成", "done": "已完成", "replied": "已回复",
-    "failed": "失败", "error": "错误", "unknown": "结果待核对",
+    "failed": "失败", "error": "错误", "unknown": "结果待核对", "not_sent": "未发出",
     "unresolved": "待人工处理", "resolved": "已人工处理", "cancelled": "已取消",
     "awaiting_pickup": "待会话领取", "notified": "已通知", "awaiting_reply": "等待答复",
 }
 REPLY_MODES = {"required": "需要回复", "none": "仅通知", "deferred": "稍后答复"}
 PENDING = {"pending", "queued", "submitting", "submitted", "received", "running", "returning"}
-ISSUES = {"failed", "error", "unknown", "unresolved"}
+ISSUES = {"failed", "error", "unknown", "unresolved", "not_sent"}
 RECONCILABLE = {"submitting", "submitted", "received", "returning", "failed", "unknown", "awaiting_reply"}
 
 
@@ -73,6 +78,22 @@ def display_state(mail):
     if mail["state"] == "unknown" and mail.get("detail") == "配对收件箱待领取":
         return "awaiting_pickup"
     return mail["state"]
+
+
+def receipt_label(mail):
+    stage=mail.get('receipt')
+    labels={'registered':'已登记','native_queued':'已入队','delivered':'已送达','not_sent':'未发出'}
+    state=display_state(mail)
+    if stage in labels:
+        label=labels[stage]
+        if stage=='not_sent' and state=='resolved':
+            return label+' · 已处理'
+        if state=='queued':
+            return label+' · 待投递'
+        if state in ('awaiting_reply','returning','returned','awaiting_pickup','unknown','failed'):
+            return label+' · '+STATES.get(state,state)
+        return label
+    return STATES.get(state,state)
 
 
 def display_time(value):
@@ -140,7 +161,7 @@ class Backend:
             errors["bindings"] = str(exc)
         try:
             if self.store is not None:
-                result["messages"] = self.store.messages()
+                result["messages"] = self.store.receipts(Path(self.args.desktop_db).with_name('thread_history_1.sqlite'))
                 result["cleanup"] = callable(getattr(self.store, "reconcile", None))
             else:
                 errors["messages"] = errors["bindings"]
@@ -166,6 +187,29 @@ class Backend:
         if binding not in self.bindings():
             raise ValueError("这组配对已变更，请刷新列表并重新确认。")
         self.store.unbind(binding["id"])
+        project = Path(binding["desktop_cwd"]).resolve()
+        if (project_hooks.has_receipt_hooks(project, self.args.store) and
+                not any(Path(b["desktop_cwd"]).resolve() == project for b in self.bindings())):
+            return project
+
+    def disable_unused_hooks(self, project):
+        with self.store.unpaired_project(project):
+            project_hooks.set_enabled(project, self.args.store, False)
+
+    def setup_hooks(self, binding):
+        project = Path(binding["desktop_cwd"])
+        if binding not in self.bindings() or not project.is_absolute() or not project.is_dir():
+            raise ValueError("所选活动配对或项目目录已变更，请刷新后重试。")
+        native = self.catalog("desktop", self.args.desktop_db, binding["desktop"])
+        if not any(r["native_id"] == binding["desktop"] and Path(r["cwd"]).samefile(project) for r in native):
+            raise ValueError("Desktop 会话的实际工作目录与配对记录不符。")
+        path = project_hooks.install(project, self.args.store)
+        try:
+            project_hooks.set_enabled(project, self.args.store, True)
+        except project_hooks.ReviewRequired:
+            project_hooks.open_review(project)
+            return f"{path}\n\n在打开的 Codex CLI 输入 /hooks，审核并启用两条 inbox.py 收件命令。"
+        return f"{path}\n\n两条收件命令均已信任并启用。在 Desktop 新回合中使用。"
 
     def create_request(self, desktop_id, title):
         """新建Claude配对请求"""
@@ -586,6 +630,9 @@ class Panel:
                              command=lambda k=kind: self.open_home(k), style="Accent.TButton")
             btn.pack(anchor="w")
             self.card_buttons[kind] = btn
+            if kind == "desktop":
+                self.hook_button = ttk.Button(card, text="设置项目收件", command=self.setup_home_hooks)
+                self.hook_button.pack(anchor="w", pady=(5, 0))
         heading = ttk.Frame(self.workspace)
         heading.pack(fill="x", pady=(16, 5))
         ttk.Label(heading, text="最近往来", font=("Microsoft YaHei UI", 12, "bold")).pack(side="left")
@@ -660,6 +707,7 @@ class Panel:
         for kind in KINDS:
             self.card_labels[kind].configure(text=self.short_title(binding.get(kind+"_title") or "未命名会话") if binding else "—")
             self.card_buttons[kind].state(["!disabled" if binding and "bindings" not in self.errors else "disabled"])
+        self.hook_button.state(["!disabled" if binding and "bindings" not in self.errors else "disabled"])
         messages = list(reversed(self.messages.values()))
         issues = [m for m in messages if display_state(m) in ISSUES]
         self.issue_id = issues[0]["id"] if issues else None
@@ -668,7 +716,7 @@ class Panel:
             self.attention.pack(fill="x", pady=(0,6))
         else:
             self.attention.pack_forget()
-        rows = {str(m["id"]): ((STATES.get(display_state(m),display_state(m)), ("Claude → Astra" if m["source"] == "cc" else "Astra → Claude") + "　" + (m["body"] or "—").splitlines()[0]),
+        rows = {str(m["id"]): ((receipt_label(m), ("Claude → Astra" if m["source"] == "cc" else "Astra → Claude") + "　" + (m["body"] or "—").splitlines()[0]),
                 ("issue",) if display_state(m) in ISSUES else ()) for m in messages if m["binding_id"] == self.home_id}
         sync_rows(self.recent, rows)
         self.read_button.state(["!disabled" if self.recent.selection() else "disabled"])
@@ -677,6 +725,16 @@ class Panel:
         binding = self.home_binding()
         if binding:
             messagebox.showinfo("查看配对", describe(*endpoints(binding)), parent=self.root)
+
+    def setup_home_hooks(self):
+        binding = self.home_binding()
+        if binding:
+            project = binding["desktop_cwd"]
+            self.confirm("设置项目收件",
+                f"Desktop 工作目录\n{project}\n\n启用工作台的 PreToolUse 和 PostToolUse 收件命令。首次设置会合并到 .codex/hooks.json，"
+                "需要审核时会打开该目录的 Codex CLI。",
+                lambda: self.backend.setup_hooks(binding),
+                lambda result: messagebox.showinfo("项目收件", result, parent=self.root))
 
     def open_home(self, kind):
         binding = self.home_binding()
@@ -712,7 +770,8 @@ class Panel:
         self.mail_summary.pack(side="left")
         self.resolve_button = ttk.Button(top, text="标记为已处理…", command=self.resolve)
         self.resolve_button.pack(side="right")
-        table, self.inbox = tree_table(mail, [("state", "状态", 95), ("reply_mode", "回复模式", 75),
+        ttk.Button(top,text="按编号查找…",command=self.find_receipt).pack(side="right",padx=4)
+        table, self.inbox = tree_table(mail, [("state", "发件回执", 115), ("reply_mode", "回复模式", 75),
                                               ("created", "创建时间", 140), ("body", "消息", 260),
                                               ("detail", "处理详情", 220)], 7)
         table.pack(fill="both", expand=True, pady=(8, 7))
@@ -729,6 +788,19 @@ class Panel:
         self.detail.pack(fill="both", expand=True)
         self.detail_text = None
         self.inbox.bind("<<TreeviewSelect>>", lambda _: self.message_detail())
+
+    def find_receipt(self):
+        key=simpledialog.askstring("查回执","信件 ID 或错误编号",parent=self.root)
+        if not key:
+            return
+        key=key.strip().lower()
+        if not self.inbox.exists(key):
+            messagebox.showinfo("查回执","当前记录中没有这个编号。",parent=self.root)
+            return
+        self.inbox.selection_set(key)
+        self.inbox.focus(key)
+        self.inbox.see(key)
+        self.message_detail()
 
     def selected_binding(self):
         index = self.saved.current()
@@ -881,7 +953,7 @@ class Panel:
                 pending += state in PENDING
                 issues += state in ISSUES
                 reply_mode_label = REPLY_MODES.get(m.get("reply_mode", "required"), "—")
-                values = (STATES.get(state, state), reply_mode_label, display_time(m.get("created")),
+                values = (receipt_label(m), reply_mode_label, display_time(m.get("created")),
                           str(m.get("body") or "—").partition("\n")[0],
                           str(m.get("detail") or "").partition("\n")[0])
                 tags = ("issue",) if state in ISSUES else ("pending",) if state in PENDING else ()
@@ -933,11 +1005,12 @@ class Panel:
 
             state_note = ""
             if state == "notified":
-                state_note = "（通知已投递，无需回复）"
+                state_note = "（单向通知，无需回复）"
             elif state == "awaiting_reply":
                 state_note = "（等待后续答复，不阻塞新消息）"
 
-            text = (f"{m.get('body') or '—'}\n\n处理详情　{m.get('detail') or '—'}\n回复　{m.get('reply') or '—'}\n\n消息 ID　{m['id']}　　状态　{STATES.get(state, state)}（{state}）{state_note}\n"
+            id_label='错误编号' if m.get('receipt')=='not_sent' else '信件 ID'
+            text = (f"{m.get('body') or '—'}\n\n发件回执　{receipt_label(m)}\n依据　{m.get('receipt_evidence') or '—'}\n处理详情　{m.get('detail') or '—'}\n回复　{m.get('reply') or '—'}\n\n{id_label}　{m['id']}　　处理状态　{STATES.get(state, state)}（{state}）{state_note}\n"
                     f"回复模式　{reply_mode_label}\n"
                     f"配对 {m.get('binding_id', '')}　{src.upper()} → {dst.upper()}\n"
                     f"发件　{m.get(src+'_title', '')}　{m.get(src, '')}\n"
@@ -995,7 +1068,16 @@ class Panel:
         binding = self.selected_binding()
         prompt = (f"解除配对 {binding['id']}？\n\n{describe(*endpoints(binding))}"
                   "\n\n解除后，这组会话的双向配对授权将终止。")
-        self.confirm("解除已有配对", prompt, lambda: self.backend.unbind(binding))
+        self.confirm("解除已有配对", prompt, lambda: self.backend.unbind(binding), self.offer_disable_hooks)
+
+    def offer_disable_hooks(self, project):
+        if project is not None:
+            self.confirm("停用本目录收件",
+                f"{project}\n\n该目录的最后一组配对已解除。停用工作台的两条收件命令后，Codex 会保留对它们的信任。"
+                "选择「取消」可继续启用收件。",
+                lambda: self.backend.disable_unused_hooks(project),
+                lambda _: messagebox.showinfo("项目收件", f"{project}\n\n两条工作台收件命令已停用，信任已保留。",
+                                               parent=self.root))
 
     def _update_provision_form(self):
         """更新新建配对表单 - 仅在选项改变时更新标题和路径"""

@@ -164,6 +164,72 @@ class Front01Tests(unittest.TestCase):
                           VALUES (?,?,'desktop',?,?,?,?)""",
                        (str(uuid4()), self.binding, mode, state, body, detail))
 
+    def test_project_receipt_setup_uses_selected_desktop_and_merges_once(self):
+        self.start(home=True)
+        project = Path(self.desktop["cwd"])
+        file = project / ".codex" / "hooks.json"
+        file.parent.mkdir()
+        other = {"hooks": [{"type": "command", "command": "echo keep"}]}
+        file.write_text(json.dumps({"hooks": {"PreToolUse": [other]}}), encoding="utf8")
+        self.confirm.return_value = ""
+        with patch.object(panel.project_hooks, "set_enabled", side_effect=panel.project_hooks.ReviewRequired), \
+             patch.object(panel.project_hooks, "open_review") as review:
+            for count in (1, 2):
+                self.button("设置项目收件").invoke()
+                self.wait(lambda: review.call_count == count and self.dialogs[2].call_count == count,
+                          "setup did not reach native review")
+            review.assert_called_with(project)
+        hooks = json.loads(file.read_text(encoding="utf8"))["hooks"]
+        self.assertEqual(hooks["PreToolUse"], [other, *hooks["PostToolUse"]])
+        self.assertEqual(len(hooks["PostToolUse"]), 1)
+        self.assertIn("inbox.py", hooks["PostToolUse"][0]["hooks"][0]["command"])
+
+    def test_last_unbind_offers_optional_scoped_disable_and_rechecks_on_click(self):
+        project = Path(self.desktop["cwd"])
+        panel.project_hooks.install(project, self.db)
+        backend = panel.Backend(type('Args', (), {'store': self.db})(), None, Store)
+        backend.store = self.store
+        other_cc = dict(self.cc, id="second CC", native_id=str(uuid4()))
+        other = dict(self.free)
+        self.store.bind(other_cc, other)
+        first, second = backend.bindings()
+        self.assertIsNone(backend.unbind(first))
+        self.assertEqual(backend.unbind(second), project.resolve())
+        with patch.object(panel.project_hooks, 'set_enabled') as toggle:
+            backend.disable_unused_hooks(project)
+            toggle.assert_called_once_with(project, self.db, False)
+            self.store.bind(other_cc, other)
+            with self.assertRaisesRegex(ValueError, "活动配对"):
+                backend.disable_unused_hooks(project)
+            self.assertEqual(toggle.call_count, 1)
+
+    def test_unbind_button_offers_disable_and_cancel_keeps_hooks(self):
+        project = Path(self.desktop["cwd"])
+        panel.project_hooks.install(project, self.db)
+        self.start()
+        self.select(self.desktop["title"])
+        self.confirm.side_effect = ["", None]
+        with patch.object(panel.project_hooks, 'set_enabled') as toggle:
+            self.button("解除配对").invoke()
+            self.wait(lambda: self.confirm.call_count == 2, "last pair did not offer to disable hooks")
+            self.assertEqual(self.confirm.call_args.args[1], "停用本目录收件")
+            toggle.assert_not_called()
+
+    def test_find_failed_send_by_error_reference_and_show_reason(self):
+        ref=str(uuid4())
+        with closing(sqlite3.connect(self.db)) as db,db:
+            db.execute("""INSERT INTO send_feedback(id,binding_id,sender,reason,state)
+                VALUES(?,?,'cc','第 2 行 JSON 解析失败','shown')""",(ref,self.binding))
+        self.start()
+        self.tab(r"消息|mail")
+        with patch.object(panel.simpledialog,'askstring',return_value=ref):
+            self.button(r"按编号查找").invoke()
+        text='\n'.join(w.get('1.0','end') for w in widgets(self.root,tk.Text))
+        self.assertIn('未发出',text)
+        self.assertIn(ref,text)
+        self.assertIn('第 2 行',text)
+        self.assertIn('错误编号',text)
+
     def test_modes_are_visible_on_the_corresponding_messages(self):
         expectations = [
             ("required", "Letter A", r"required|(?<!无)(?<!不)需(?:要)?(?:本轮)?(?:回复|答复|回信)|本轮答复"),
@@ -189,7 +255,7 @@ class Front01Tests(unittest.TestCase):
         self.start()
         self.tab(r"消息|mail")
         tree, item = self.select("Letter A")
-        self.assertRegex(dict(rows(tree))[item], r"排队|待处理|queued|pending")
+        self.assertRegex(dict(rows(tree))[item], r"已登记 · 待投递|排队|待处理|queued|pending")
         resolve = r"核销|已处理|reconcile"
         self.assertTrue(self.button(resolve).instate(["disabled"]))
         tree, item = self.select("Letter B")

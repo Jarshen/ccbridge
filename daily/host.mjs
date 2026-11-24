@@ -1,3 +1,4 @@
+import {claudeSender} from './cc-sender.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -38,7 +39,7 @@ async function main() {
   const {sessionsService}=await load('modules/providers/services/sessions.service.js');
   const {providerRegistry}=await load('modules/providers/provider.registry.js');
   const {chatRunRegistry:runRegistry,runDetachedChatTurn:detached}=await load('modules/websocket/index.js');
-  const {query}=await import(pathToFileURL(require.resolve('@anthropic-ai/claude-agent-sdk')));
+  const {query,makeSendServer}=await claudeSender(require);
   const Database=require('better-sqlite3');
   const db=new Database(storePath,{fileMustExist:true});
   const desktopDb=new Database(process.env.DAILY_DESKTOP_DB,{readonly:true,fileMustExist:true});
@@ -76,7 +77,7 @@ async function main() {
   const activeUser=getConnection().prepare('SELECT min(id) AS id FROM users WHERE is_active=1 HAVING count(*)=1');
   const worker=installWorker({db,desktopDb,storePath,python:process.env.DAILY_PYTHON,desktopProvision,steer,nativeBacklog,
     defaultUserId:()=>activeUser.get()?.id,
-    sessions:sessionsDb,provider:providerRegistry.resolveProvider('claude').runtime,runtime,runRegistry,detached,query,
+    sessions:sessionsDb,provider:providerRegistry.resolveProvider('claude').runtime,runtime,runRegistry,detached,query,makeSendServer,
     externalBusy:async sid=>(await sessionsService.listRunningSessions()).some(row=>row.sessionId===sid)});
   const provision=installProvisioner({db,desktopDb,sessionsDb,userDb,cloudDb:getConnection(),detached,runtime});
   const message='日常桥已连接原生会话服务';

@@ -2,14 +2,16 @@
 // $env:ELECTRON_RUN_AS_NODE='1'
 // & "$env:LOCALAPPDATA/Programs/@cloudcli-aicloudcli-desktop/CloudCLI.exe" --test daily/test-worker.mjs
 import assert from 'node:assert/strict';
-import {execFileSync} from 'node:child_process';
+import {execFileSync,spawn} from 'node:child_process';
+import {once} from 'node:events';
+import {createInterface} from 'node:readline';
 import {randomUUID} from 'node:crypto';
 import fs from 'node:fs';
 import {createRequire} from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import {setImmediate as nextTurn} from 'node:timers/promises';
+import {setImmediate as nextTurn,setTimeout as delay} from 'node:timers/promises';
 import {fileURLToPath} from 'node:url';
 import {installWorker} from './worker.mjs';
 import {queueCli} from './codex-cli.mjs';
@@ -76,7 +78,10 @@ function fixture(t) {
       if(legacy) {
         // Model a binding already present before the pairing-notices migration.
         const old=new Database(storePath);
-        try {old.prepare('DELETE FROM pairing_notices WHERE binding_id=(SELECT id FROM bindings WHERE cc=?)').run(cc);}
+        try {
+          old.prepare('DELETE FROM pairing_notices WHERE binding_id=(SELECT id FROM bindings WHERE cc=?)').run(cc);
+          old.prepare('DELETE FROM auto_inboxes WHERE binding_id=(SELECT id FROM bindings WHERE cc=?)').run(cc);
+        }
         finally {old.close();}
       }
     }
@@ -96,6 +101,13 @@ function fixture(t) {
       async run(command, options, writer, context) {
         const request = (context.createQuery ?? query)({prompt: command, options: {systemPrompt: 'fixture'}});
         h.calls.push({command, options, writer, system: request.options.systemPrompt});
+        if(h.raw) {
+          const sid=rows.get(options.sessionId).provider_session_id;
+          for(const raw of h.raw) {
+            const frames=context.normalizeMessage({...raw,session_id:sid},sid);
+            for(const frame of frames) writer.send(frame);
+          }
+        }
         for(const event of h.events ?? [{kind:'text', role:'assistant', content:h.answer}]) writer.send(event);
         h.beforeComplete?.();
         writer.send({kind: 'complete', exitCode: h.exitCode ?? 0, aborted: h.aborted ?? false});
@@ -104,7 +116,10 @@ function fixture(t) {
     };
     const registry = new Map([['claude', provider]]);
     const runtime = {
-      run: (name, cmd, opts, writer) => registry.get(name).run(cmd, opts, writer, {}),
+      run: (name, cmd, opts, writer) => registry.get(name).run(cmd, opts, writer, {
+        normalizeMessage:raw=>raw.message?.content?.filter(p=>p.type==='text').map(p=>(
+          {kind:'text',role:raw.message.role,content:p.text,parentToolUseId:raw.parent_tool_use_id})) ?? [],
+      }),
       hasBackgroundWork: id => background.has(id),
     };
     // Like dispatchRun, reserve the app session and pass the same per-run writer
@@ -143,7 +158,7 @@ function fixture(t) {
   return {pair, session, store, boot, storePath, get db(){return db;}, mail: () => db.prepare('SELECT * FROM mail ORDER BY seq').all()};
 }
 
-test('real hook and take compete with the worker, preserving the lane and the expiry deadline',async t=>{
+for(const auto of [false,true]) test('real hook and take preserve the lane and expiry, auto='+auto,async t=>{
   const f=fixture(t), turn=randomUUID(), h=f.boot({nativeBacklog:()=>false});
   const env={...process.env,CODEX_THREAD_ID:f.pair.desktop};
   function inbox(args,event) {
@@ -152,6 +167,7 @@ test('real hook and take compete with the worker, preserving the lane and the ex
   }
   const hook=name=>inbox(['tool-hook'],{session_id:f.pair.desktop,turn_id:turn,hook_event_name:name});
   await h.turn(f.pair,'prepare'); await h.tick(); h.queued.length=0;
+  if(auto) f.db.prepare('INSERT INTO auto_inboxes(binding_id) SELECT id FROM bindings WHERE desktop=?').run(f.pair.desktop);
   hook('PreToolUse');
   for (const body of ['first private body','second private body']) await h.turn(f.pair,'发给 Astra：'+body);
   await h.tick(); await h.tick();
@@ -217,6 +233,177 @@ test('CC output keeps the listening turn observed before generation',async t=>{
   const letter=f.db.prepare('SELECT target_turn,taken_at FROM paired_letters').get();
   assert.deepEqual(letter,{target_turn:oldTurn,taken_at:null});
   assert.deepEqual(h.queued,[]);
+});
+
+test('Claude text-only packets preserve interior prose quotes and JSON escapes; malformed fields stay rejected',async t=>{
+  const f=fixture(t),h=f.boot();
+  h.answer=String.raw`ASTRA {"text":"目标："怜爱感"（温柔）。\n路径 C:\\tmp 和 \"示例\"。"}`;
+  await h.turn(f.pair,'review');
+  assert.deepEqual(f.mail().map(m=>m.body),['目标："怜爱感"（温柔）。\n路径 C:\\tmp 和 "示例"。']);
+  h.answer='ASTRA {"text":"broken "field","reply_to":bad}';
+  await assert.rejects(h.turn(f.pair,'review again'));
+  assert.equal(f.mail().length,1);
+});
+
+test('failed generated envelope gets one correction turn and returns registered ID without a receipt loop',async t=>{
+  const f=fixture(t),h=f.boot(),pair=f.pair;
+  await h.turn(pair,'setup');await h.tick();h.queued.length=0;
+  h.answer='review\nASTRA {"text":';
+  await assert.rejects(h.turn(pair,'send review'),/第 2 行/);
+  assert.deepEqual(f.mail(),[]);
+  const failure=f.db.prepare('SELECT * FROM send_feedback').get();
+  assert.equal(failure.state,'queued');assert.equal(failure.sender,'cc');
+  h.answer=packet('corrected review');
+  await h.tick();await h.tick();await h.tick();
+  const [mail]=f.mail();
+  assert.deepEqual(f.mail().map(m=>m.body),['corrected review']);
+  assert.equal(h.requests.length,1);assert.match(h.requests[0].content,/未发出.*第 2 行/);
+  assert.ok(f.db.prepare('SELECT result FROM send_feedback WHERE id=?').get(failure.id).result.includes(mail.id));
+  const restart=f.boot();await restart.tick();
+  assert.deepEqual([restart.queued.length,restart.requests.length],[0,0]);
+});
+
+test('bad packet in a completed CC task does not block the next letter or loop on a second parse failure',async t=>{
+  const f=fixture(t),h=f.boot(),pair=f.pair;
+  await h.turn(pair,'setup');await h.tick();
+  f.store('desktop_send',pair.desktop,'review',randomUUID(),'none');
+  h.answer='ASTRA {"text":';await h.tick();
+  assert.equal(f.mail()[0].state,'notified');
+  await h.tick();await h.tick();
+  assert.equal(h.requests.filter(r=>r.content.startsWith('【工作台失败回执】')).length,1);
+  const all=f.db.prepare('SELECT state,result FROM send_feedback').all();
+  assert.equal(all.length,1);assert.match(all[0].result,/仍未发出/);
+});
+
+test('CC steer registers each SDK result once on both interactive and detached paths',async t=>{
+  const f=fixture(t),h=f.boot(),pair=f.pair;
+  await h.turn(pair,'setup');await h.tick();
+  function answer(text,id,stop_reason) {
+    return {type:'assistant',uuid:randomUUID(),message:{role:'assistant',model:'claude',id,stop_reason,
+      content:[{type:'text',text}]}};
+  }
+  const result=text=>({type:'result',subtype:'success',is_error:false,result:text});
+  const a=packet('first'),b=packet('second');
+  const frames=[answer(a,'msg_1','end_turn'),result(a),
+    {type:'user',isReplay:true,uuid:randomUUID(),message:{role:'user',content:[{type:'text',text:'next task'}]}},
+    answer(b,'msg_2',null),result(b)];
+  h.raw=frames;h.events=[];
+  f.store('desktop_send',pair.desktop,'start a review',randomUUID(),'none');
+  await h.tick();
+  assert.deepEqual(f.mail().filter(m=>m.source==='cc').map(m=>m.body),['first','second']);
+  const next=f.boot();next.raw=frames;next.events=[];
+  await next.turn(pair,'redeliver identical SDK events after restart');
+  next.raw=[answer(a,'msg_3',null),result(a)];
+  await next.turn(pair,'new message deliberately repeats first body');
+  assert.deepEqual(f.mail().filter(m=>m.source==='cc').map(m=>m.body),['first','second','first']);
+});
+
+test('automatic inbox uses an actual stdio watch once and queues when cancelled or idle',async t=>{
+  const f=fixture(t), turn=randomUUID();
+  const h=f.boot({nativeBacklog:()=>false});
+  const binding=f.db.prepare('SELECT id FROM bindings WHERE desktop=?').get(f.pair.desktop).id;
+  f.db.prepare('INSERT INTO auto_inboxes(binding_id) VALUES(?)').run(binding);
+  const historyFile=f.storePath+'.history';
+  const history=new Database(historyFile);
+  history.exec('CREATE TABLE thread_turns(thread_id,turn_id,status,rollout_ordinal)');
+  history.prepare("INSERT INTO thread_turns VALUES(?,?,'inProgress',1)").run(f.pair.desktop,turn);
+  history.close();
+  const child=spawn(python,['-B','paired_inbox.py','--history',historyFile,'--store',f.storePath,'serve'],
+    {cwd:daily,windowsHide:true,stdio:['pipe','pipe','inherit']});
+  const closed=once(child,'close');
+  const lines=createInterface({input:child.stdout})[Symbol.asyncIterator]();
+  function send(frame){child.stdin.write(JSON.stringify({jsonrpc:'2.0',...frame})+'\n');}
+  function call(id,name,args={}) {
+    send({id,method:'tools/call',params:{name,arguments:args,
+      _meta:{threadId:f.pair.desktop,'x-codex-turn-metadata':{turn_id:turn}}}});
+  }
+  async function response(id) {
+    const frame=JSON.parse((await lines.next()).value);
+    assert.equal(frame.id,id);
+    return JSON.parse(frame.result.content[0].text);
+  }
+  async function listening() {
+    const end=Date.now()+5000;
+    while(!f.db.prepare('SELECT watch_id FROM auto_inboxes WHERE binding_id=?').get(binding).watch_id) {
+      assert.ok(Date.now()<end,'watch did not register');
+      await delay(20);
+    }
+  }
+  try {
+    call(1,'watch');await listening();
+    send({method:'notifications/cancelled',params:{requestId:1}});
+    assert.equal((await response(1)).status,'unavailable');
+    await h.turn(f.pair,'发给 Astra：cancelled listener');await h.tick();
+    call(2,'watch');await listening();
+    f.db.prepare('INSERT INTO inbox_tool_turns VALUES(?,?,unixepoch())').run(binding,turn);
+    await h.turn(f.pair,'发给 Astra：live evidence');
+    await h.tick(); // The native claim cannot race ahead of the waiting MCP request.
+    const notice=await response(2);
+    assert.equal(notice.status,'ready');
+    await h.tick();  // no queue while take is outstanding
+    call(3,'take',{id:notice.id});assert.equal((await response(3)).text,'live evidence');
+    call(4,'take',{id:notice.id});assert.equal((await response(4)).status,'unavailable');
+    assert.equal(f.db.prepare('SELECT count(*) AS n FROM inbox_offers WHERE mail_id=?').get(notice.id).n,0);
+    f.db.prepare('DELETE FROM inbox_tool_turns WHERE binding_id=?').run(binding);
+    await h.turn(f.pair,'发给 Astra：no active watch');await h.tick();
+    call(5,'watch');await listening();
+    const ended=new Database(historyFile);
+    ended.prepare("UPDATE thread_turns SET status='completed'").run();ended.close();
+    await h.turn(f.pair,'发给 Astra：ended turn');
+    assert.equal((await response(5)).status,'unavailable');await h.tick();
+    assert.deepEqual(h.queued.map(q=>envelope(q.prompt).text),['cancelled listener','no active watch','ended turn']);
+    assert.equal(f.db.prepare('SELECT count(*) AS n FROM paired_submissions WHERE mail_id=?').get(notice.id).n,0);
+  } finally {child.stdin.end();await closed;}
+});
+
+test('auto routing rejects a changed turn and expired watch; uncertain native ack is not replayed',async t=>{
+  const f=fixture(t), turn=randomUUID();
+  const h=f.boot({steer:()=>assert.fail('auto fallback should use native queue')});
+  const binding=f.db.prepare('SELECT id FROM bindings WHERE desktop=?').get(f.pair.desktop).id;
+  f.db.prepare('INSERT INTO auto_inboxes(binding_id,turn,watch_id,expires_ms) VALUES(?,?,?,?)')
+    .run(binding,turn,randomUUID(),Date.now()+10000);
+  h.answer=packet('ended before publication','none');
+  h.beforeComplete=()=>f.db.prepare('UPDATE auto_inboxes SET turn=?,watch_id=?').run(randomUUID(),randomUUID());
+  await h.turn(f.pair,'review');await h.tick();
+  h.beforeComplete=null;
+  f.db.prepare('UPDATE auto_inboxes SET expires_ms=0').run();
+  h.queue=async()=>{throw Error('ack missing');};
+  await h.turn(f.pair,'发给 Astra：expired');await h.tick();
+  assert.deepEqual(h.queued.map(q=>envelope(q.prompt).text),['ended before publication','expired']);
+  assert.equal(f.db.prepare('SELECT count(*) AS n FROM paired_letters').get().n,0);
+  const after=f.boot();await after.tick();
+  assert.deepEqual(after.queued,[]);assert.equal(f.mail()[1].state,'unknown');
+});
+
+test('normal relay covers an immediate reply before watch and a second reply between watch and take',async t=>{
+  const f=fixture(t),h=f.boot(),turn=randomUUID(),dir=path.dirname(f.storePath);
+  const binding=f.db.prepare('SELECT id FROM bindings WHERE desktop=?').get(f.pair.desktop).id;
+  f.db.prepare('INSERT INTO auto_inboxes(binding_id) VALUES(?)').run(binding);
+  const history=new Database(path.join(dir,'thread_history_1.sqlite'));
+  history.exec('CREATE TABLE thread_turns(thread_id,turn_id,status,rollout_ordinal)');
+  history.prepare("INSERT INTO thread_turns VALUES(?,?,'inProgress',1)").run(f.pair.desktop,turn);
+  history.close();
+  const env={...process.env,CODEX_THREAD_ID:f.pair.desktop,CODEX_HOME:dir};
+  const cli=(file,...args)=>JSON.parse(execFileSync(python,['-B',file,'--store',f.storePath,...args],
+    {cwd:daily,env,windowsHide:true,stdio:['ignore','pipe','pipe']}));
+  await h.turn(f.pair,'setup');
+  const id=randomUUID();
+  assert.equal(cli('relay.py','send','--binding',String(binding),'--id',id,'--text','review').id,id);
+  h.answer=packet('instant reply','none');await h.tick();await h.tick();
+  assert.equal(f.mail()[1].state,'queued');assert.deepEqual(h.queued,[]);
+  const watch=()=>cli('paired_inbox.py','watch','--turn',turn);
+  const take=mid=>cli('paired_inbox.py','take','--turn',turn,'--id',mid);
+  const first=watch();
+  await h.turn(f.pair,'发给 Astra：between watch and take');await h.tick();
+  await h.turn(f.pair,'发给 Astra：third in burst');await h.tick();
+  assert.equal(take(first.id).text,'instant reply');
+  const second=watch();assert.equal(take(second.id).text,'between watch and take');
+  const third=watch();assert.equal(take(third.id).text,'third in burst');
+  assert.equal(take(first.id).status,'unavailable');assert.deepEqual(h.queued,[]);
+  await h.turn(f.pair,'发给 Astra：absent reader');await h.tick();
+  f.db.prepare('UPDATE burst_offers SET expires_ms=0').run();
+  await h.tick();await h.tick();
+  assert.deepEqual(h.queued.map(q=>envelope(q.prompt).text),['absent reader']);
 });
 
 test('direct address is inert outside the binding and queues exactly once inside it', async t => {
@@ -461,7 +648,8 @@ test('Desktop review, evidence, explicit later CC reply and unconfirmed final qu
   f.store('desktop_confirm',pair.desktop,review);
   await later.tick();
   assert.equal(f.mail()[0].state,'returned');
-  assert.equal(later.requests.length,1);
+  assert.equal(later.requests.length,2);
+  assert.match(later.requests[1].content,/工作台失败回执.*未发出/);
   const returns=later.queued.filter(q=>q.prompt.includes(review));
   assert.equal(returns.length,1);
   checkReply(returns[0].prompt,review,pair.cc,pair.desktop,'正式结论');
@@ -506,7 +694,8 @@ test('intermediate packets, wrong IDs and aborted detached tasks cannot reply; u
   await restart.tick();
   assert.deepEqual(f.mail().map(m=>[m.id,m.state,m.reply]),[
     [first,'awaiting_reply',null],[second,'awaiting_reply',null],[third,'unknown',null],[fourth,'queued',null]]);
-  assert.equal(restart.requests.length,0);
+  assert.equal(restart.requests.length,1);
+  assert.match(restart.requests[0].content,/工作台失败回执.*未发出/);
   assert.equal(h.queued.filter(q=>q.prompt.includes(first)).length,0);
 });
 
@@ -661,7 +850,7 @@ test('first inbound briefing survives restart and preserves multiline letters ve
 
 test('a newly committed pair gets the project roles once on both sides, before ordinary mail',async t=>{
   const f=fixture(t), pair=f.session(true,false), h=f.boot({defaultUserId:()=>17});
-  const roles=fs.readFileSync(path.join(daily,'pairing-brief.md'),'utf8').trimEnd();
+  const role=who=>fs.readFileSync(path.join(daily,'..','配对分工-'+who+'.md'),'utf8').trim();
   const binding=f.db.prepare('SELECT * FROM bindings WHERE cc=?').get(pair.cc);
   const reselect=()=>f.store('bind',{id:pair.cc,native_id:binding.native_cc,cwd:pair.cwd,title:'CC'},
     {id:binding.desktop_host,native_id:pair.desktop,cwd:binding.desktop_cwd,title:'Desktop'});
@@ -670,14 +859,16 @@ test('a newly committed pair gets the project roles once on both sides, before o
   await Promise.all([h.tick(),h.tick()]);
   assert.equal(h.queued.length,1);
   assert.equal(h.queued[0].thread,pair.desktop);
-  assert.ok(h.queued[0].prompt.startsWith(roles+'\n\n'));
+  assert.ok(h.queued[0].prompt.startsWith(role('Astra')+'\n\n'));
+  assert.ok(!h.queued[0].prompt.includes(role('Claude')));
   assert.equal(h.requests.length,0);
   const next=f.boot({defaultUserId:()=>17});
-  next.answer=packet('a welcome is not an outgoing letter');
+  next.answer='收到分工说明。';
   await next.tick();
   assert.equal(next.requests.length,1);
   assert.equal(next.requests[0].sessionId,pair.cc);
-  assert.ok(next.requests[0].content.startsWith(roles+'\n\n'));
+  assert.ok(next.requests[0].content.startsWith(role('Claude')+'\n\n'));
+  assert.ok(!next.requests[0].content.includes(role('Astra')));
   assert.equal(next.requests[0].options.permissionMode,'default');
   assert.equal(next.queued.length,0);
   assert.equal(f.mail().length,0);
@@ -690,6 +881,48 @@ test('a newly committed pair gets the project roles once on both sides, before o
   assert.equal(again.queued.length,0);
   assert.deepEqual(f.db.prepare('SELECT recipient,state FROM pairing_notices ORDER BY recipient').all(),
     [{recipient:'cc',state:'sent'},{recipient:'desktop',state:'sent'}]);
+});
+
+test('each welcome reads the current role file in its recipient project when ready',async t=>{
+  const f=fixture(t),h=f.boot({defaultUserId:()=>17}),pair=f.session(true,false);
+  const {desktop_cwd}=f.db.prepare('SELECT desktop_cwd FROM bindings WHERE cc=?').get(pair.cc);
+  fs.mkdirSync(desktop_cwd);fs.mkdirSync(pair.cwd);
+  fs.writeFileSync(path.join(desktop_cwd,'配对分工-Astra.md'),'本项目技术职责');
+  fs.writeFileSync(path.join(desktop_cwd,'配对分工-Claude.md'),'另一个工作目录');
+  const ccFile=path.join(pair.cwd,'配对分工-Claude.md');
+  fs.writeFileSync(ccFile,'旧草稿');
+  h.processing.add(pair.cc);await h.tick();
+  assert.ok(h.queued[0].prompt.startsWith('本项目技术职责\n\n'));
+  fs.writeFileSync(ccFile,'刚修改的体验职责');
+  h.processing.clear();await h.tick();await h.tick();
+  assert.equal(h.queued.length,1);assert.equal(h.requests.length,1);
+  assert.ok(h.requests[0].content.startsWith('刚修改的体验职责\n\n'));
+});
+
+test('explicit ASTRA at the end of a welcome reply is registered once, including across restart',async t=>{
+  const f=fixture(t),h=f.boot({defaultUserId:()=>17}),pair=f.session();
+  h.answer='收到。我会向 Astra 传达任务。\n\n---\n\n'+packet('调整额角发束\n请核对正面与侧面。');
+  await Promise.all([h.tick(),h.tick()]);
+  const [letter]=f.mail();
+  assert.equal(f.mail().length,1);
+  assert.equal(letter.body,'调整额角发束\n请核对正面与侧面。');
+  assert.equal(letter.source,'cc');assert.equal(letter.reply_mode,'none');
+  assert.equal(h.calls.at(-1).writer.events.at(-1).text,'已登记 · '+letter.id);
+  const after=f.boot();
+  await after.tick();await after.tick();
+  assert.equal(after.requests.length,0);
+  assert.deepEqual(after.queued.map(q=>[q.thread,envelope(q.prompt).id]),[[pair.desktop,letter.id]]);
+});
+
+test('a malformed welcome packet records one failure independently of welcome delivery',async t=>{
+  const f=fixture(t),h=f.boot({defaultUserId:()=>17});f.session();
+  h.answer='ASTRA {"text":';
+  await h.tick();
+  assert.equal(f.mail().length,0);
+  assert.equal(f.db.prepare("SELECT state FROM pairing_notices WHERE recipient='cc'").get().state,'sent');
+  const failure=f.db.prepare('SELECT state,correction,reason FROM send_feedback').get();
+  assert.equal(failure.state,'queued');assert.equal(failure.correction,1);
+  assert.match(failure.reason,/JSON 解析失败/);
 });
 
 test('uncertain welcome acknowledgements are never replayed on restart',async t=>{
