@@ -1,0 +1,165 @@
+"""Local decision notes and explicit single-side session handoff."""
+import argparse
+from contextlib import closing
+import hashlib
+import json
+import os
+from pathlib import Path
+import sqlite3
+from uuid import uuid4
+
+if __package__:
+    from .catalog import list_sessions
+else:
+    from catalog import list_sessions
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS continuity_links(binding_id INTEGER PRIMARY KEY REFERENCES bindings(id),root INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS continuity_notes(
+ rev INTEGER PRIMARY KEY, root INTEGER NOT NULL, topic TEXT NOT NULL, kind TEXT NOT NULL,
+ audience TEXT NOT NULL, body TEXT NOT NULL, evidence TEXT NOT NULL, binding_id INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS continuity_files(rev INTEGER PRIMARY KEY REFERENCES continuity_notes(rev),path TEXT NOT NULL,digest TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS continuity_checks(ticket TEXT NOT NULL REFERENCES continuity_tickets(id),literal TEXT NOT NULL,
+ PRIMARY KEY(ticket,literal));
+CREATE TABLE IF NOT EXISTS continuity_stage(ticket TEXT PRIMARY KEY REFERENCES continuity_tickets(id), boot TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS continuity_tickets(
+ id TEXT PRIMARY KEY, binding_id INTEGER NOT NULL REFERENCES bindings(id), side TEXT NOT NULL,
+ candidate TEXT NOT NULL, native TEXT NOT NULL, title TEXT NOT NULL, root INTEGER NOT NULL,
+ revision INTEGER NOT NULL, mail_seq INTEGER NOT NULL, packet TEXT NOT NULL, state TEXT NOT NULL,
+ readback TEXT, detail TEXT, boot TEXT, expires INTEGER, successor INTEGER REFERENCES bindings(id),
+ prepared_at INTEGER NOT NULL DEFAULT (unixepoch()));
+"""
+
+
+def active(db, binding):
+    row = db.execute("SELECT * FROM bindings WHERE id=? AND active=1", (binding,)).fetchone()
+    if not row:
+        raise ValueError("原配对已改变，请核对当前执行归属")
+    root = db.execute("SELECT root FROM continuity_links WHERE binding_id=?", (binding,)).fetchone()
+    return row, root[0] if root else binding
+
+
+def notes(db, root, side):
+    return [dict(r) for r in db.execute("""
+        SELECT n.rev,topic,kind,audience,body,evidence,f.path,f.digest FROM continuity_notes n
+        LEFT JOIN continuity_files f ON f.rev=n.rev
+        WHERE root=? AND n.rev IN (SELECT max(rev) FROM continuity_notes WHERE root=? GROUP BY topic)
+        AND (audience='both' OR audience=?) ORDER BY n.rev""", (root, root, side))]
+
+
+def revision(db, root):
+    return db.execute("SELECT coalesce(max(rev),0) FROM continuity_notes WHERE root=?", (root,)).fetchone()[0]
+
+
+def run(args):
+    store = Path(args.store).resolve(strict=True)
+    with closing(sqlite3.connect(store.as_uri()+"?mode=rw", uri=True, timeout=5)) as db, db:
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA foreign_keys=ON")
+        db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA)
+        if args.command in ("status", "request", "cancel"):
+            ticket = db.execute("SELECT * FROM continuity_tickets WHERE id=?", (args.ticket,)).fetchone()
+            if not ticket:
+                raise ValueError("未知交接编号")
+            if args.command == "status":
+                return dict(ticket)
+            if args.command == "cancel":
+                db.execute("UPDATE continuity_tickets SET state='cancelled' WHERE id=? AND successor IS NULL",
+                           (args.ticket,))
+            elif ticket["state"] not in ("requested", "committed"):
+                active(db, ticket["binding_id"])
+                if ticket["side"] == "cc" and not ticket["readback"]:
+                    raise ValueError("候选 Claude 尚无原生核对答复")
+                # The host publishes its own instance in its normal heartbeat.
+                status = json.loads(Path(args.status_file or store.with_name("status.json")).read_text(encoding="utf8"))
+                if (status["state"] != "ready" or Path(status["store"]).resolve() != store
+                        or ticket["state"] not in ("prepared", "reviewed", "blocked")):
+                    raise ValueError("桥或交接状态不允许接管")
+                db.execute("""UPDATE continuity_tickets SET state='requested',boot=?,expires=unixepoch()+30,
+                              detail=NULL WHERE id=?""", (status["instance"], args.ticket))
+            return dict(db.execute("SELECT * FROM continuity_tickets WHERE id=?", (args.ticket,)).fetchone())
+        route, root = active(db, args.binding)
+        rev = revision(db, root)
+        if args.command == "show":
+            return dict(binding=args.binding, revision=rev, notes=notes(db, root, args.side))
+        if args.command == "note":
+            if args.base != rev:
+                raise ValueError(f"方向已更新到 {rev}，请先 show 再核对迟到结果")
+            if not all(s.strip() for s in (args.topic, args.text, args.evidence)):
+                raise ValueError("需要事项、实际变化与可回查的依据")
+            row = db.execute("""INSERT INTO continuity_notes(root,topic,kind,audience,body,evidence,binding_id)
+                    VALUES(?,?,?,?,?,?,?)""", (root,args.topic,args.kind,args.audience,args.text,
+                                                 args.evidence,args.binding))
+            if args.file:
+                path = args.file.resolve(strict=True)
+                with path.open('rb') as src:
+                    digest = hashlib.file_digest(src,'sha256').hexdigest()
+                db.execute("INSERT INTO continuity_files VALUES(?,?,?)",(row.lastrowid,str(path),digest))
+            return dict(revision=row.lastrowid)
+        candidate = next((r for r in list_sessions(args.side, args.index) if r["id"] == args.candidate), None)
+        if not candidate or Path(candidate["cwd"]) != Path(route[args.side+"_cwd"]):
+            raise ValueError("候选不在原端项目或原生索引无法确认")
+        if db.execute("""SELECT 1 FROM bindings WHERE cc=? OR native_cc=? OR desktop=? OR desktop_host=?""",
+                      (candidate["id"],candidate["native_id"],candidate["native_id"],candidate["id"])).fetchone():
+            raise ValueError("候选曾有配对，请使用新会话")
+        current = notes(db, root, args.side)
+        if not current or not args.work.strip():
+            raise ValueError("请先记录有效方向，并交代未完操作及其执行归属")
+        status = json.loads(Path(args.status_file or store.with_name("status.json")).read_text(encoding="utf8"))
+        if status["state"]!="ready" or Path(status["store"]).resolve()!=store or not status.get("instance"):
+            raise ValueError("请在目标桥就绪后准备交接")
+        key = str(uuid4())
+        packet = dict(ticket=key, role=args.side, project=route[args.side+"_cwd"], revision=rev,
+                      previous_binding=args.binding, partner=route["desktop" if args.side=="cc" else "cc"],
+                      notes=current, work=args.work,
+                      instruction="请回查关键原始样品或实际文件，说明交付、约束、局部认可、未决点、反证和下一步。接管成功后才执行移交任务。最后单列：接续核对 "+key)
+        seq = db.execute("SELECT coalesce(max(seq),0) FROM mail WHERE binding_id=?", (args.binding,)).fetchone()[0]
+        db.execute("""INSERT INTO continuity_tickets(id,binding_id,side,candidate,native,title,root,revision,
+                      mail_seq,packet,state) VALUES(?,?,?,?,?,?,?,?,?,?,'prepared')""",
+                   (key,args.binding,args.side,candidate["id"],candidate["native_id"],candidate["title"],
+                    root,rev,seq,json.dumps(packet,ensure_ascii=False)))
+        for literal in set(args.expect):
+            if not literal.strip():
+                raise ValueError("核对值不能为空")
+            db.execute("INSERT INTO continuity_checks VALUES(?,?)",(key,literal))
+        db.execute("INSERT INTO continuity_stage VALUES(?,?)",(key,status["instance"]))
+        return packet
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--store", default=os.environ.get("DAILY_BRIDGE_STORE") or Path(__file__).parent/"data/bridge.sqlite3")
+    commands = parser.add_subparsers(dest="command",required=True)
+    for name in ("show","note","prepare"):
+        cmd = commands.add_parser(name)
+        cmd.add_argument("--binding",type=int,required=True)
+        if name == "note":
+            cmd.add_argument("--base",type=int,required=True)
+            cmd.add_argument("--topic",required=True)
+            cmd.add_argument("--kind",choices=["用户原话","用户局部认可","用户整体验收","模型推测","实测事实","未决"],required=True)
+            cmd.add_argument("--audience",choices=["both","cc","desktop"],default="both")
+            cmd.add_argument("--text",required=True)
+            cmd.add_argument("--evidence",required=True)
+            cmd.add_argument("--file",type=Path,help="固定本地样品版本；换新时复核 SHA-256")
+        else:
+            cmd.add_argument("--side",choices=["cc","desktop"],required=True)
+        if name == "prepare":
+            cmd.add_argument("--index",type=Path,required=True)
+            cmd.add_argument("--status-file",type=Path)
+            cmd.add_argument("--candidate",required=True)
+            cmd.add_argument("--work",required=True)
+            cmd.add_argument("--expect",action="append",default=[],help="可选的客观样品标识，要求候选答复含此值；不放入交接包")
+    for name in ("request","status","cancel"):
+        cmd = commands.add_parser(name)
+        cmd.add_argument("ticket")
+        if name == "request":
+            cmd.add_argument("--status-file",type=Path)
+    try:
+        print(json.dumps(run(parser.parse_args()),ensure_ascii=False,indent=2))
+    except (ValueError,OSError,KeyError,sqlite3.Error) as error:
+        parser.exit(1,str(error)+"\n")
+
+
+if __name__=="__main__":
+    main()

@@ -32,6 +32,12 @@ class StorageTests(unittest.TestCase):
         self.worker = sqlite3.connect(self.path, isolation_level=None)
         self.addCleanup(self.worker.close)
 
+    def legacy_request(self, text):
+        mid = str(uuid4())
+        self.worker.execute("INSERT INTO mail(id,binding_id,source,body,reply_mode) VALUES (?,?,'desktop',?,'required')",
+                            (mid, self.binding, text))
+        return mid
+
     def incoming(self, state, reply_mode="required"):
         mail_id = str(uuid4())
         self.worker.execute("""
@@ -177,7 +183,7 @@ class StorageTests(unittest.TestCase):
         with self.assertRaisesRegex(sqlite3.IntegrityError, "active binding"):
             self.incoming("queued")
         self.worker.execute("INSERT INTO mail(id,binding_id,source,body) VALUES ('new',?,'cc','hi')", (current,))
-        self.assertEqual((41, "required"), self.worker.execute("SELECT seq,reply_mode FROM mail WHERE id='new'").fetchone())
+        self.assertEqual((41, "none"), self.worker.execute("SELECT seq,reply_mode FROM mail WHERE id='new'").fetchone())
         self.assertEqual([], self.worker.execute("PRAGMA foreign_key_check").fetchall())
 
     def test_notification_rejects_replies_and_allows_retirement_after_delivery(self):
@@ -318,7 +324,7 @@ class StorageTests(unittest.TestCase):
         queued = self.incoming("queued")
         with self.assertRaisesRegex(ValueError, "state queued"):
             self.store.desktop_reply(self.thread, queued, "early")
-        sent = self.store.desktop_send(self.thread, "question", str(uuid4()), "required")
+        sent = self.legacy_request("question")
         with self.assertRaisesRegex(ValueError, "No incoming"):
             self.store.desktop_reply(self.thread, sent, "wrong direction")
         self.store.bind(session("replacement"), self.desktop)
@@ -338,7 +344,7 @@ class StorageTests(unittest.TestCase):
         other = session("other")
         self.store.bind(session("second-cc"), other)
         for state in ("returning", "submitted", "unknown"):
-            mail_id = self.store.desktop_send(self.thread, "question", str(uuid4()), "required")
+            mail_id = self.legacy_request("question")
             self.worker.execute("UPDATE mail SET state=? WHERE id=?", (state, mail_id))
             with self.assertRaisesRegex(ValueError, "stored reply"):
                 self.store.desktop_confirm(self.thread, mail_id)
@@ -348,7 +354,7 @@ class StorageTests(unittest.TestCase):
             self.store.desktop_confirm(self.thread, mail_id)
             self.assertEqual(mail_id, Store(self.path).desktop_confirm(self.thread, mail_id))
         for state in ("queued", "submitting", "received", "failed", "cancelled"):
-            mail_id = self.store.desktop_send(self.thread, "question", str(uuid4()), "required")
+            mail_id = self.legacy_request("question")
             self.worker.execute("UPDATE mail SET state=?,reply='answer' WHERE id=?", (state, mail_id))
             with self.assertRaisesRegex(ValueError, f"state {state}"):
                 self.store.desktop_confirm(self.thread, mail_id)
@@ -358,7 +364,7 @@ class StorageTests(unittest.TestCase):
             self.store.desktop_confirm(self.thread, wrong)
 
     def test_confirm_after_rebind_rejects_old_returned_mail(self):
-        mail_id = self.store.desktop_send(self.thread, "question", str(uuid4()), "required")
+        mail_id = self.legacy_request("question")
         self.worker.execute("UPDATE mail SET state='returning', reply='yes' WHERE id=?", (mail_id,))
         self.store.desktop_confirm(self.thread, mail_id)
         self.store.bind(session("replacement"), self.desktop)
@@ -378,7 +384,8 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual({"id": mail_id}, json.loads(result.stdout))
         self.assertEqual("none", self.store.messages()[0]["reply_mode"])
-        mail_id = self.store.desktop_send(self.thread, "legacy", str(uuid4()), "required")
+        mail_id = self.legacy_request("legacy")
+        self.assertEqual(mail_id, self.store.desktop_send(self.thread, "legacy", mail_id, "none"))
         self.worker.execute("UPDATE mail SET state='returning',reply='answer' WHERE id=?", (mail_id,))
         self.assertEqual(0, relay("confirm", "--id", mail_id).returncode)
         incoming = self.incoming("submitting")
@@ -386,17 +393,17 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(0, relay("--store", str(self.path), "reply", "--id", incoming, "--text", "receipt").returncode)
         self.assertFalse(self.path.with_suffix(".unused").exists())
         self.assertEqual(["queued", "returned", "received"], [r["state"] for r in self.store.messages()])
-        for mode in ("none", "deferred"):
+        for mode in ("none", "deferred", "required"):
             mail_id = str(uuid4())
             send = ("--store", str(self.path), "send", "--binding", str(self.binding),
                     "--id", mail_id, "--text", "hello")
             for _ in range(2):
-                result = relay(*send, "--mode", mode)
+                result = relay(*send, "--mode", mode, "--wait", "60")
                 self.assertEqual(0, result.returncode, result.stderr)
                 self.assertEqual({"id": mail_id}, json.loads(result.stdout))
             self.assertEqual(0, relay(*send).returncode)
             self.assertNotEqual(0, relay(*send, "--mode", "invalid").returncode)
-        self.assertEqual(["none", "required", "required", "none", "deferred"],
+        self.assertEqual(["none", "required", "required", "none", "none", "none"],
                          [m["reply_mode"] for m in self.store.messages()])
         del env["CODEX_THREAD_ID"]
         self.assertNotEqual(0, relay("confirm", "--id", mail_id).returncode)

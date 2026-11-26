@@ -196,6 +196,8 @@ Path('result').write_text(helper.value)
         port = normal.getsockname()[1]
         marker = dict(port=port, host=launch.LOCAL, pid=os.getpid())
         c.marker.write_text(json.dumps(marker))
+        damaged = bytes(222)
+        c.status.write_bytes(damaged)
         with patch.object(launch, "configure", return_value=c), patch.object(subprocess, "Popen") as popen:
             launch.launch(True)
         args = popen.call_args.args[0]
@@ -206,7 +208,7 @@ Path('result').write_text(helper.value)
         self.assertIn(str(port), blocked["message"])
         self.assertTrue(c.store.is_file())
         self.assertEqual(launch.listeners(port), {(launch.LOCAL, os.getpid())})
-        self.assertIsNone(launch.read_json(c.status))
+        self.assertEqual(c.status.read_bytes(), damaged)
         normal.close()
         with self.assertRaises(launch.Blocked):
             launch.enable(c)  # marker process is still alive despite no listener

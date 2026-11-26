@@ -135,7 +135,7 @@ function readOutboundLine(line,allowProse) {
   if(mode!==undefined && mode!==reply_mode)
     throw Error('ASTRA mode 与 reply_mode 冲突');
   if(!['required','none','deferred'].includes(reply_mode)) throw Error('ASTRA reply_mode 无效');
-  return {mode:reply_mode,text:shortText(packet?.text)};
+  return {mode:'none',text:shortText(packet?.text)};
 }
 
 // A provider can keep its writer open for background activity after the terminal event.
@@ -161,7 +161,7 @@ function observeTurn() {
 }
 
 export function installWorker({db, desktopDb, sessions, provider, runtime, runRegistry, detached, makeSendServer,
-    query, python, storePath, desktopProvision, queue = nativeQueue, steer, nativeBacklog,
+    query, python, storePath, desktopProvision, queue = nativeQueue, steer, nativeBacklog, handoff,
     externalBusy = async () => false, defaultUserId = () => null, notify = console.error}) {
   db.pragma('foreign_keys = ON');
   db.pragma('busy_timeout = 5000');
@@ -363,7 +363,7 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
       }
     }
     const wrapped={...context};
-    if(context.normalizeMessage) wrapped.normalizeMessage=(raw,sid)=>{
+    if(!scope.toolOnly && context.normalizeMessage) wrapped.normalizeMessage=(raw,sid)=>{
       const events=context.normalizeMessage(raw,sid);
       if(scope.done || raw.session_id!==binding.native_cc || raw.parent_tool_use_id || raw.parentToolUseId) return events;
       if(raw.type==='assistant' && raw.message?.id && !raw.isReplay && !raw.error &&
@@ -400,16 +400,31 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
   }
   const previous = provider.run.bind(provider);
   provider.run = async (command,opts,writer,context) => {
+    const check=handoff?.claimReadback(command,opts,writer);
+    if (check) {
+      const observe=observeTurn(), send=writer.send;
+      writer.send=function(event) {
+        const final=observe(event);
+        if (final) check.finish(final.text);
+        return send.call(this,event);
+      };
+      try {return await previous(check.prompt,opts,writer,context);}
+      finally {writer.send=send;}
+    }
+    handoff?.changedSession(opts.sessionId);
     if (desktopProvision && !detachedWriters.has(writer) && [createDesktop,cancelDesktop].includes(command?.trim?.())) {
       const status = await desktopProvision.handle(command.trim(),opts,writer.userId);
       return previous('【工作台配对结果】'+status+' 请只向用户转达这项结果。',opts,writer,context);
     }
     const binding = active.get(opts.sessionId);
+    if (!binding) {
+      const owner=handoff?.retiredOwner(opts.sessionId);
+      if (owner) return previous('【工作台】此会话原任务已移交至配对 #'+owner+'。保留历史供查询，后续工作请到接管方继续。\n'+command,opts,writer,context);
+    }
     if (!binding || !validCC(binding) || !samePath(opts.cwd,binding.cc_cwd) || !Number.isInteger(writer.userId))
       return previous(command,opts,writer,context);
     if(detachedWriters.has(writer)) {
-      const scope=detachedWriters.get(writer);
-      return previous(command,opts,writer,scope ? sendingContext(context,binding,scope,writer) : context);
+      return previous(command,opts,writer,sendingContext(context,binding,detachedWriters.get(writer),writer));
     }
     const settings = Object.fromEntries(['model','effort','permissionMode','toolsSettings']
       .filter(k=>opts[k]!==undefined).map(k=>[k,opts[k]]));
@@ -460,10 +475,10 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
       if(needsBrief && completed) recordBrief.run(binding.id);
       if(deliveryError) throw deliveryError;
       return result;
-    } finally { scope.done=true;writer.send=send; }
+    } finally { scope.done=true;writer.send=send;handoff?.changedSession(opts.sessionId); }
   };
 
-  async function ccTurn(binding,receiver,prompt,scope=null) {
+  async function ccTurn(binding,receiver,prompt,scope={toolOnly:true}) {
     let final,showStatus;
     const observe=observeTurn();
     const observed=Object.create(runtime);
@@ -548,7 +563,7 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
         if(!notification) content+='\n'+envelope;
         const needsBrief=!briefed.get({binding:binding.id});
         if(needsBrief) content+='\n\n'+ccBrief;
-        const r=await ccTurn(binding,receiver,content,initial && mail.reply_mode==='none' ? {route,related:mail.id} : null);
+        const r=await ccTurn(binding,receiver,content,notification ? {route,related:mail.id} : {toolOnly:true});
         if(!r.started && r.error===busyError) {set.run(mail.state,'等待 CC 空闲',mail.id,claimed);return 'busy';}
         if(!r.started) {set.run('failed',r.error || 'CC 回合未启动',mail.id,claimed);return;}
         if(r.error || !r.complete) throw Error(r.error || 'CC 回合完成情况未确认');
@@ -667,7 +682,10 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
         receiver=getReceiver.get(binding.id);
       }
     }
-    const brief=readPairingBrief(binding,recipient);
+    const notes=handoff ? '\n仅在方向、反馈或证据发生变化时，代用户用 '+quotePS(fileURLToPath(new URL('./handoff.py',import.meta.url)))+
+      ' --store '+quotePS(storePath)+' show --binding '+binding.id+' --side '+recipient+
+      ' 查看有效方向，note --help 可查增量记录方式。保留用户原话、局部认可和样品版本。方向改变要给搭档发一次短消息。' : '';
+    const brief=readPairingBrief(binding,recipient)+notes+(handoff?.notice(binding.id) || '');
     if(!claimNotice.run(binding.id,recipient).changes) return;
     try {
       if(recipient==='cc') {

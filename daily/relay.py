@@ -21,10 +21,8 @@ def originating_turn(thread):
 
 if __package__:
     from .storage import REPLY_MODES, Store, _uuid
-    from . import inbox
 else:
     from storage import REPLY_MODES, Store, _uuid
-    import inbox
 
 
 def main():
@@ -100,32 +98,16 @@ def main():
             print(json.dumps({k:found[k] for k in ('id','binding_id','receipt','receipt_evidence','state','detail','next_action')}))
             return
         if args.command == "send":
-            receipt = None
-            turn=originating_turn(thread) if not args.wait else None
+            turn=originating_turn(thread)
             if args.follow:
                 with closing(sqlite3.connect(path)) as db:
                     enabled=db.execute('SELECT 1 FROM auto_inboxes WHERE binding_id=?',(args.binding,)).fetchone()
-                if not turn or args.wait or args.mode not in (None,'none') or not enabled:
+                if not turn or not enabled:
                     raise ValueError('--follow requires an active Desktop turn and an automatic one-way binding')
-            if args.wait and args.mode == "none":
-                raise ValueError("通知无需回信，请移除 --wait")
-            if args.wait:
-                scope = (_uuid(args.id,"mail ID"),args.binding,_uuid(thread,"thread ID"))
-                with closing(sqlite3.connect(path,isolation_level=None)) as db:
-                    lease = inbox.arm(db,scope,args.wait)
             mail_id = store.desktop_send(thread, args.text, args.id, expected_binding=args.binding,
-                                         handoff_turn=turn, prefer_hook=not args.follow,
-                                         reply_mode=args.mode or ("required" if args.wait else None))
-            if args.wait:
-                if lease["status"] == "armed":
-                    with closing(sqlite3.connect(path,isolation_level=None)) as db:
-                        receipt = inbox.read(db,scope,args.wait)
-                else:
-                    receipt = lease
-                if receipt.get("status") == "ready":
-                    receipt["next"] = "使用同目录 inbox.py --store <同一数据库> accept --binding <binding> --id <id> --receipt <receipt>。只有 accepted 才在本轮执行；否则由原生投递处理。"
-                print(json.dumps({"id":mail_id,"binding":args.binding,**receipt}))
-                return
+                                         handoff_turn=turn, prefer_hook=not args.follow)
+            if args.wait or args.mode in ('required','deferred'):
+                print('Legacy reply options ignored. New mail is one-way. Use --follow to receive subsequent letters.', file=sys.stderr)
             try:
                 with closing(sqlite3.connect(path)) as db, db:
                     hint=db.execute('UPDATE auto_inboxes SET hint_pending=0 WHERE binding_id=? AND hint_pending=1',

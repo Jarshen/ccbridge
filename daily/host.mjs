@@ -9,6 +9,7 @@ import {setTimeout as delay} from 'node:timers/promises';
 import {installWorker} from './worker.mjs';
 import {queueCli} from './codex-cli.mjs';
 import {installProvisioner} from './provision.mjs';
+import {handoffs} from './handoff.mjs';
 import {desktopRequests} from './desktop-request.mjs';
 import {localSteerer} from './steer.mjs';
 import {execFile} from 'node:child_process';
@@ -75,16 +76,23 @@ async function main() {
     return !!queueDb.prepare('SELECT 1 FROM queued_items WHERE thread_id=? LIMIT 1').get(threadId);
   }
   const activeUser=getConnection().prepare('SELECT min(id) AS id FROM users WHERE is_active=1 HAVING count(*)=1');
-  const worker=installWorker({db,desktopDb,storePath,python:process.env.DAILY_PYTHON,desktopProvision,steer,nativeBacklog,
+  let historyDb;
+  const desktopFile=name=>path.join(path.dirname(process.env.DAILY_DESKTOP_DB),name);
+  const externalBusy=async sid=>(await sessionsService.listRunningSessions()).some(row=>row.sessionId===sid);
+  const handoff=handoffs({db,desktopDb,sessions:sessionsDb,runtime,runRegistry,externalBusy,boot:instance,
+    history:()=>historyDb ??= new Database(desktopFile('thread_history_1.sqlite'),{readonly:true,fileMustExist:true}),
+    backlog:id=>fs.existsSync(desktopFile('queue_1.sqlite')) ? nativeBacklog(id) : undefined});
+  const worker=installWorker({db,desktopDb,storePath,python:process.env.DAILY_PYTHON,desktopProvision,steer,nativeBacklog,handoff,
     defaultUserId:()=>activeUser.get()?.id,
     sessions:sessionsDb,provider:providerRegistry.resolveProvider('claude').runtime,runtime,runRegistry,detached,query,makeSendServer,
-    externalBusy:async sid=>(await sessionsService.listRunningSessions()).some(row=>row.sessionId===sid)});
+    externalBusy});
   const provision=installProvisioner({db,desktopDb,sessionsDb,userDb,cloudDb:getConnection(),detached,runtime});
   const message='日常桥已连接原生会话服务';
   status('ready',message);
   setInterval(()=>status('ready',message),3000).unref();
   setInterval(()=>worker.tick().catch(e=>console.error('配对调度失败',e.message)),500).unref();
   setInterval(()=>provision.tick().catch(e=>console.error('新建配对失败',e.message)),1000).unref();
+  setInterval(()=>handoff.tick().catch(e=>console.error('换新核对失败',e.message)),1000).unref();
   setInterval(()=>{try {desktopProvision.tick();} catch(e) {console.error('Desktop 配对失败',e.message);}},1000).unref();
 }
 try {await main();}

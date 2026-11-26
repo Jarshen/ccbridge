@@ -101,6 +101,7 @@ function fixture(t) {
       async run(command, options, writer, context) {
         const request = (context.createQuery ?? query)({prompt: command, options: {systemPrompt: 'fixture'}});
         h.calls.push({command, options, writer, system: request.options.systemPrompt});
+        h.onRequest?.(request);
         if(h.raw) {
           const sid=rows.get(options.sessionId).provider_session_id;
           for(const raw of h.raw) {
@@ -155,7 +156,12 @@ function fixture(t) {
     h.tick = worker.tick;
     return h;
   }
-  return {pair, session, store, boot, storePath, get db(){return db;}, mail: () => db.prepare('SELECT * FROM mail ORDER BY seq').all()};
+  function legacy(source,desktop,body,id,mode) {
+    db.prepare('INSERT INTO mail(id,binding_id,source,body,reply_mode) SELECT ?,id,?,?,? FROM bindings WHERE desktop=? AND active=1')
+      .run(id,source,body,mode,desktop);
+    return id;
+  }
+  return {pair, session, store, boot, legacy, storePath, get db(){return db;}, mail: () => db.prepare('SELECT * FROM mail ORDER BY seq').all()};
 }
 
 for(const auto of [false,true]) test('real hook and take preserve the lane and expiry, auto='+auto,async t=>{
@@ -455,8 +461,8 @@ test('early Desktop receipt survives the queue ack and restart; CC notification 
   const first = f.boot();
   const settings = {model: 'fixture-model', effort: 'high', permissionMode: 'plan',
     toolsSettings: {disallowedTools: ['Bash']}};
-  await first.turn(pair, packet('check','required'), {...settings, attachments: ['turn-specific']}, 41);
-  const [{id}] = f.mail();
+  await first.turn(pair, 'setup', {...settings, attachments: ['turn-specific']}, 41);
+  const id = f.legacy('cc',pair.desktop,'check',randomUUID(),'required');
   first.queue = () => {
     f.store('desktop_reply', pair.desktop, id, 'verified');
     return 'late ack';
@@ -542,7 +548,7 @@ test('Desktop mail defers during active and background CC work, then returns onc
   const f = fixture(t), h = f.boot(), {cc, desktop} = f.pair;
   await h.turn(f.pair, 'remember receiver');
   const id = 'ab071923-beca-4afe-9b82-9a8f4d28e908';
-  f.store('desktop_send', desktop, 'question', id, 'required');
+  f.legacy('desktop', desktop, 'question', id, 'required');
   f.store('desktop_send', desktop, 'question', id, 'required');
   for (const busy of [h.processing, h.background]) {
     busy.add(cc);
@@ -586,7 +592,7 @@ for (const [code, syscall, expected] of [
 test('CC review and evidence reach Desktop FIFO before any answer; a later reply returns only once', async t => {
   const f=fixture(t), h=f.boot(), {pair}=f;
   h.answer=packet('echo must not be queued');
-  await h.turn(pair,packet('请分步复核，完成后再回复','deferred'));
+  f.legacy('cc',pair.desktop,'请分步复核，完成后再回复',randomUUID(),'deferred');
   await h.turn(pair,'通知 Astra：第二份证据');
   await h.turn(pair,'通知 Astra：第三份证据');
   const [review,second,third]=f.mail();
@@ -615,7 +621,7 @@ test('CC review and evidence reach Desktop FIFO before any answer; a later reply
 test('Desktop review, evidence, explicit later CC reply and unconfirmed final queue ack', async t => {
   const f=fixture(t), {pair}=f, other=f.session(), h=f.boot();
   await h.turn(pair,'remember receiver');
-  const send=(text,mode)=>f.store('desktop_send',pair.desktop,text,randomUUID(),mode);
+  const send=(text,mode)=>mode==='deferred' ? f.legacy('desktop',pair.desktop,text,randomUUID(),mode) : f.store('desktop_send',pair.desktop,text,randomUUID());
   const review=send('核对证据、复现差异并提交正式结论','deferred');
   const evidence=send('第二份证据','none');
   h.answer='已开始核对';
@@ -655,11 +661,23 @@ test('Desktop review, evidence, explicit later CC reply and unconfirmed final qu
   checkReply(returns[0].prompt,review,pair.cc,pair.desktop,'正式结论');
 });
 
+test('a pending historical required request still exposes the independent send tool',async t=>{
+  const f=fixture(t),h=f.boot({makeSendServer:send=>({send})});
+  await h.turn(f.pair,'setup');
+  const old=f.legacy('desktop',f.pair.desktop,'old question',randomUUID(),'required');
+  let receipt;
+  h.onRequest=request=>{receipt=request.options.mcpServers.daily_pair.send('separate evidence',1);};
+  h.answer='original formal answer';
+  await h.tick();
+  assert.deepEqual(f.mail().map(m=>[m.id,m.reply_mode,m.reply,m.body]),[
+    [old,'required','original formal answer','old question'],[receipt,'none',null,'separate evidence']]);
+});
+
 test('detached deferred task may use authorized tools and reply explicitly at successful completion', async t => {
   const f=fixture(t), h=f.boot(), {pair}=f;
   const settings={permissionMode:'default',toolsSettings:{allowedTools:['Read']}};
   await h.turn(pair,'review setup',settings);
-  const id=f.store('desktop_send',pair.desktop,'复核用户指定的材料',randomUUID(),'deferred');
+  const id=f.legacy('desktop',pair.desktop,'复核用户指定的材料',randomUUID(),'deferred');
   const assistant=content=>({kind:'text',role:'assistant',content});
   h.events=[assistant('已接单'),{kind:'tool_use',toolName:'Read'},{kind:'tool_result'},
     assistant('复核完毕。\n\n'+canonicalReply(id,'核对完成，两份材料一致。'))];
@@ -678,7 +696,7 @@ test('detached deferred task may use authorized tools and reply explicitly at su
 test('intermediate packets, wrong IDs and aborted detached tasks cannot reply; unknown holds the lane', async t => {
   const f=fixture(t), h=f.boot(), {pair}=f;
   await h.turn(pair,'setup');
-  const send=()=>f.store('desktop_send',pair.desktop,'复核',randomUUID(),'deferred');
+  const send=()=>f.legacy('desktop',pair.desktop,'复核',randomUUID(),'deferred');
   const first=send(), second=send(), third=send();
   h.events=[{kind:'text',role:'assistant',content:reply(first,'进度')},{kind:'tool_use'},
     {kind:'text',role:'assistant',parentToolUseId:'child',content:reply(first,'子任务结果')}];
@@ -708,14 +726,14 @@ test('ASTRA JSON modes and direct default preserve FIFO; invalid batch is atomic
   h.answer=[packet('should roll back'),packet('bad','later')].join('\n');
   await assert.rejects(h.turn(f.pair,'send'),/reply_mode/);
   assert.deepEqual(f.mail().map(m=>[m.body,m.reply_mode]),[
-    ['review','deferred'],['evidence','none'],['direct JSON','none'],['结论呢','none']]);
+    ['review','none'],['evidence','none'],['direct JSON','none'],['结论呢','none']]);
   for(let i=0;i<4;i++) await h.tick();
-  assert.deepEqual(h.queued.map(q=>envelope(q.prompt).reply_mode),['deferred','none','none','none']);
+  assert.deepEqual(h.queued.map(q=>envelope(q.prompt).reply_mode),['none','none','none','none']);
 });
 
 test('early formal Desktop reply wins over deferred queue ack',async t=>{
   const f=fixture(t), h=f.boot(), {pair}=f;
-  await h.turn(pair,packet('复核','deferred'));
+  f.legacy('cc',pair.desktop,'复核',randomUUID(),'deferred');
   await h.turn(pair,'通知 Astra：附件');
   const [review,evidence]=f.mail();
   h.queue=()=>{
@@ -734,8 +752,8 @@ test('early formal Desktop reply wins over deferred queue ack',async t=>{
 test('normal assistant prose can end in one atomic block of new mail and formal replies',async t=>{
   const f=fixture(t), h=f.boot(), {pair}=f;
   await h.turn(pair,'setup');
-  const first=f.store('desktop_send',pair.desktop,'review A',randomUUID(),'deferred');
-  const second=f.store('desktop_send',pair.desktop,'review B',randomUUID(),'deferred');
+  const first=f.legacy('desktop',pair.desktop,'review A',randomUUID(),'deferred');
+  const second=f.legacy('desktop',pair.desktop,'review B',randomUUID(),'deferred');
   await h.tick();
   await h.tick();
   const block=[
@@ -790,7 +808,7 @@ test('only unquoted contiguous assistant tail packets or whole user packet comma
 test('stale explicit replies identify the original in chat and roll back the whole batch',async t=>{
   const f=fixture(t), h=f.boot(), {pair}=f;
   await h.turn(pair,'setup');
-  const send=()=>f.store('desktop_send',pair.desktop,'review',randomUUID(),'deferred');
+  const send=()=>f.legacy('desktop',pair.desktop,'review',randomUUID(),'deferred');
   const open=send(), closed=send();
   await h.tick();
   await h.tick();
@@ -818,7 +836,7 @@ test('stale explicit replies identify the original in chat and roll back the who
 test('detached deferred delivery rejects a mixed batch and reports cancellation during the turn',async t=>{
   const f=fixture(t), h=f.boot(), {pair}=f;
   await h.turn(pair,'setup');
-  const send=()=>f.store('desktop_send',pair.desktop,'review',randomUUID(),'deferred');
+  const send=()=>f.legacy('desktop',pair.desktop,'review',randomUUID(),'deferred');
   const first=send(), second=send();
   h.answer=['Review complete','',packet('new mail'),canonicalReply(first,'result')].join('\n');
   await h.tick();
@@ -956,9 +974,8 @@ test('pair instructions appear once; ordinary notifications contain only display
     assert.equal(desktopNotification,'Claude〔'+f.mail().at(-2).id+'〕\n'+text);
     assert.ok(!ccNotification.includes(deskId));
     assert.ok(h.calls.slice(1).every(call=>!call.command.includes('配对约定：') && call.system==='fixture'));
-    await h.turn(pair,packet('findings?','required'));
-    const ccRequest=f.mail().at(-1).id;
-    const deskRequest=f.store('desktop_send',pair.desktop,'findings?',randomUUID(),'required');
+    const ccRequest=f.legacy('cc',pair.desktop,'findings?',randomUUID(),'required');
+    const deskRequest=f.legacy('desktop',pair.desktop,'findings?',randomUUID(),'required');
     h.answer=text;
     await h.tick();
     assert.equal(envelope(h.requests.at(-1).content).id,deskRequest);

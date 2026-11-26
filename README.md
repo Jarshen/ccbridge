@@ -30,6 +30,8 @@ codex mcp add daily_pair_inbox -- $python -B -X utf8 $inbox serve
 
 ## 发件与回执
 
+日常通信只发单向信。即使发送方沿用旧命令 `--mode required --wait 60`，也会立即返回登记编号。接收方需要传回结论时另发一封；`--follow` 只监听后续来信。升级前已经登记的正式请求继续按原编号结算。
+
 「消息记录」的详情会给出下一步，命令行查回执时对应 JSON 中的 `next_action`。例如原生入队后可以用原编号查询进展；发送或监听输出结果不明时，先核对原聊天。使用 `send --follow` 时，桥先为该回合保留唯一领取权，正文成功写入监听输出后才登记领取回执。输出中断会留下待核对记录，原信不会重复投递。
 
 在 CloudCLI Chat 中让 Claude 调用 `mcp__daily_pair__send` 可取得登记编号。也支持助手答复末行的 `ASTRA {"text":"正文"}`；同一运行中通过 steer 追加任务时，各次完成的答复分别登记。独立 Claude CLI 可以从配对项目目录运行 `py -3 <工作台>/daily/relay.py cc-send --binding <配对号> --native-cc <Claude原生ID> --id <本封UUID> --text-file 正文.txt`。正文文件使用 UTF-8，同一封重试沿用原 ID。
@@ -42,6 +44,10 @@ codex mcp add daily_pair_inbox -- $python -B -X utf8 $inbox serve
 - **Claude → Desktop** 可在 Claude 输入 **新建 Desktop 配对**，在打开的 Desktop 草稿中发送预填首信。桥核对项目目录和申请号后绑定。可在 Claude 输入 **取消 Desktop 配对申请**。
 - 需要核对前端版本时运行 `py -3 daily/launcher.py --verify-frontend`。新安装默认打开随源码校验的新版首页。手动回滚可用 `--rollback-frontend`，重新启用可用 `--promote-frontend <发布的SHA256>`。[发布摘要](daily/release-frontend.json)
 
+## 单侧换新
+
+需要更换配对中的一端时，可记录已确认的方向、证据和未完事项，由新会话核对材料后接管；另一端沿用原聊天。只有交接状态为 `committed` 才算完成。[单侧换新说明](daily/换新说明.md)
+
 ## 开发验收
 
 在 Windows PowerShell 的仓库根目录运行以下命令。Python 测试包含 Tk 界面，桌面会短暂出现测试窗口。JS 测试使用 CloudCLI 的 Electron 以匹配原生 SQLite 驱动，并使用临时数据库和测试会话。
@@ -52,7 +58,7 @@ py -3 -B -X utf8 -m unittest @cases
 $env:ELECTRON_RUN_AS_NODE = '1'
 $env:DAILY_PYTHON = py -3 -c "import sys; print(sys.executable)"
 $electron = Join-Path $env:LOCALAPPDATA 'Programs/@cloudcli-aicloudcli-desktop/CloudCLI.exe'
-& $electron --test daily/test-worker.mjs daily/test-provision.mjs
+& $electron --test daily/test-handoff.mjs daily/test-worker.mjs daily/test-provision.mjs
 ```
 
 双击入口也支持从终端运行 `& '.\双会话工作台.cmd' --acceptance`，在独立本机端口和空索引上检查首次启动。日常配对和此模式各用独立数据库。验收结束后运行 `py -3 daily/launcher.py --acceptance --stop`。

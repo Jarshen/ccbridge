@@ -339,7 +339,12 @@ def enable(c):
     with host_guard(c.home) as handle:
         marker = read_json(c.marker)
         c.port = endpoint(marker, c.env, c.port, c.root)
-        status = read_json(c.status)
+        try:
+            status = read_json(c.status)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            # A damaged heartbeat cannot identify a running host. The marker,
+            # listening sockets and inherited process guard still protect startup.
+            status = None
         owners = listeners(c.port)
         if healthy(c, marker, status, owners):
             return

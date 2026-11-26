@@ -52,8 +52,8 @@ class InboxTests(unittest.TestCase):
                               input=json.dumps(event), capture_output=True, text=True, timeout=6)
 
     def send(self):
-        self.store.desktop_send(self.thread, "private original", self.id, "deferred",
-                                expected_binding=self.binding)
+        self.db.execute("INSERT INTO mail(id,binding_id,source,body,reply_mode) VALUES(?,?,'desktop','private original','deferred')",
+                        (self.id, self.binding))
 
     def reply(self):
         self.db.execute("UPDATE mail SET state='received', reply='private CC answer' WHERE id=?", (self.id,))
@@ -126,7 +126,8 @@ class InboxTests(unittest.TestCase):
         token = inbox.read(self.db, self.scope, 0)["receipt"]
         other = str(uuid4()), self.binding, self.thread
         inbox.arm(self.db, other, 60)
-        self.store.desktop_send(self.thread, "another request", other[0], "required", expected_binding=self.binding)
+        self.db.execute("INSERT INTO mail(id,binding_id,source,body,reply_mode) VALUES(?,?,'desktop','another request','required')",
+                        (other[0], self.binding))
         self.db.execute("UPDATE mail SET state='received',reply='another answer' WHERE id=?", (other[0],))
         self.assertEqual({"status": "not_accepted"}, inbox.accept(self.db, other, token))
         gate = threading.Barrier(2)
@@ -154,8 +155,8 @@ class InboxTests(unittest.TestCase):
         cc_id = str(uuid4())
         cc_scope = cc_id, *self.scope[1:]
         inbox.arm(self.db, cc_scope, 60)
-        self.db.execute("""INSERT INTO mail(id,binding_id,source,body,state,reply)
-                           VALUES (?,?,'cc','private new job','received','private answer')""", (cc_id, self.binding))
+        self.db.execute("""INSERT INTO mail(id,binding_id,source,body,state,reply,reply_mode)
+                           VALUES (?,?,'cc','private new job','received','private answer','required')""", (cc_id, self.binding))
         self.assertNotIn("reply", inbox.read(self.db, cc_scope, 0))
         self.assertNotEqual(0, self.cli("wait", thread=False).returncode)
         self.db.execute("UPDATE mail SET state='returned'")

@@ -39,7 +39,7 @@ CREATE TABLE {table} (
     binding_id INTEGER NOT NULL REFERENCES bindings(id),
     source TEXT NOT NULL CHECK (source IN ('cc', 'desktop')),
     body TEXT NOT NULL,
-    reply_mode TEXT NOT NULL DEFAULT 'required' CHECK (reply_mode IN ('required', 'none', 'deferred')),
+    reply_mode TEXT NOT NULL DEFAULT 'none' CHECK (reply_mode IN ('required', 'none', 'deferred')),
     state TEXT NOT NULL DEFAULT 'queued' CHECK (state IN
         ('queued', 'submitting', 'submitted', 'received', 'returning',
          'returned', 'failed', 'unknown', 'cancelled', 'notified', 'awaiting_reply')),
@@ -120,7 +120,7 @@ class Store:
                 # insert trigger after copying history, which includes retired routes.
                 db.execute(MAIL_TABLE.format(table="mail_new"))
                 fields = "seq, id, binding_id, source, body, state, reply, detail, created"
-                db.execute(f"INSERT INTO mail_new ({fields}) SELECT {fields} FROM mail")
+                db.execute(f"INSERT INTO mail_new ({fields}, reply_mode) SELECT {fields}, 'required' FROM mail")
                 # Deleted messages may have used sequence numbers above MAX(seq).
                 db.execute("""
                     UPDATE sqlite_sequence
@@ -239,7 +239,7 @@ class Store:
 
     def desktop_send(self, thread_id, text, request_id, reply_mode=None, *, expected_binding=None,
                      handoff_turn=None, prefer_hook=False):
-        """Enqueue a Desktop-origin letter once. Return its canonical request UUID."""
+        """New letters are one-way. A retry of an older UUID keeps its stored envelope."""
         request_id = _uuid(request_id, "request_id")
         _text(text, "body")
         if reply_mode is not None and reply_mode not in REPLY_MODES:
@@ -250,7 +250,7 @@ class Store:
             binding_id = self._origin(db, thread_id)
             if expected_binding is not None and expected_binding != binding_id:
                 raise ValueError("Expected binding is no longer active for this Desktop thread")
-            row = db.execute("SELECT binding_id, source, body, reply_mode FROM mail WHERE id = ?",
+            row = db.execute("SELECT binding_id, source, body FROM mail WHERE id = ?",
                              (request_id,)).fetchone()
             if row is None:
                 if prefer_hook and handoff_turn and db.execute(
@@ -258,15 +258,15 @@ class Store:
                     if db.execute("""SELECT 1 FROM inbox_tool_turns WHERE binding_id=? AND turn_id=?
                                      AND seen_at>unixepoch()-60""", (binding_id, handoff_turn)).fetchone():
                         handoff_turn = None
-                if handoff_turn and reply_mode in (None,'none'):
+                if handoff_turn:
                     db.execute("""INSERT INTO turn_handoffs(binding_id,turn,expires_ms)
                         SELECT binding_id,?,(unixepoch()+45)*1000 FROM auto_inboxes WHERE binding_id=?
                         ON CONFLICT(binding_id) DO UPDATE SET turn=excluded.turn,expires_ms=excluded.expires_ms""",
                                (_uuid(handoff_turn,'turn'),binding_id))
                 db.execute("INSERT INTO mail(id, binding_id, source, body, reply_mode) VALUES (?, ?, 'desktop', ?, ?)",
-                           (request_id, binding_id, text, reply_mode or "none"))
-            elif tuple(row) != (binding_id, "desktop", text, reply_mode or row["reply_mode"]):
-                raise ValueError("Request ID already used for a different message, reply mode or binding")
+                           (request_id, binding_id, text, "none"))
+            elif (row["binding_id"], row["source"], row["body"]) != (binding_id, "desktop", text):
+                raise ValueError("Request ID already used for a different message or binding")
         return request_id
 
     def desktop_reply(self, thread_id, mail_id, text):
