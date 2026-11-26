@@ -29,6 +29,11 @@ def matches(item_json, mail):
 
 def enrich(store, history_path, rows, only_id=None):
     with closing(store._connect()) as db:
+        reviews=db.execute('SELECT request_id,conclusion_id,closed_reason FROM review_requests WHERE ? IS NULL OR request_id=?',
+                           (only_id,only_id)).fetchall()
+        if only_id:
+            selected={only_id,*(r[1] for r in reviews)}
+            rows=[m for m in rows if m['id'] in selected]
         saved = dict(db.execute('SELECT mail_id,turn_id FROM delivery_evidence'))
         has_inbox = db.execute("SELECT 1 FROM sqlite_master WHERE name='paired_letters'").fetchone()
         claims = dict(db.execute("""SELECT l.mail_id,l.target_turn FROM paired_letters l
@@ -85,8 +90,38 @@ def enrich(store, history_path, rows, only_id=None):
                              'shown':'已提示发件方','unknown':'提醒结果待核对'}.get(f['state'],f['state']),
                              reply=None,reply_mode='none',created=f['created'],cc=f['cc'],desktop=f['desktop'],
                              cc_title=f['cc_title'],desktop_title=f['desktop_title']))
+        by_id={r['id']:r for r in rows}
+        for key,result,closed in reviews:
+            request=by_id.get(key)
+            if not request:
+                continue
+            if closed:
+                label='评审已关闭 · '+closed
+                action='需要再次评审时另行发起。'
+            elif result:
+                # The worker may link a new conclusion after messages() took
+                # its snapshot. A later refresh can acquire its receipt.
+                reply=by_id.get(result)
+                stage=reply['receipt'] if reply else 'registered'
+                label={'delivered':'评审结论已送达发起方','native_queued':'结论已入原生队列，待发起方读取',
+                       'registered':'结论已登记，待送达'}.get(stage,'结论投递待核对 · '+stage)
+                label+=' · '+result
+                action='在发起方聊天核对结论。' if stage=='delivered' else '用结论编号核对其投递进度。'
+            elif request['state']=='notified' and request['source']=='desktop':
+                label='评审回合已结束，待回传结论'
+                action='在原评审会话用 send 的 review_to 和此原信编号补交可共享的结论。'
+            elif request['state'] in ('failed','unknown','cancelled'):
+                label='评审原信需核对 · '+request['state']
+                action='按原信编号核对原生会话和工作台记录。'
+            else:
+                label='评审委托待结论'
+                action='可继续独立工作，等待评审结论。'
+            request.update(review_status=label,conclusion_id=result,next_action=action)
+            request['receipt_evidence']+=' · '+label
+        if only_id:
+            rows=[r for r in rows if r['id']==only_id]
     for row in rows:
-        row['next_action'] = receipt_action(row)
+        row.setdefault('next_action',receipt_action(row))
     return sorted(rows,key=lambda m:m['created'])
 
 

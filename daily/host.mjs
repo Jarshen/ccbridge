@@ -27,7 +27,7 @@ const instance=randomUUID();
 function status(state,message) {
   const tmp=statusFile+'.'+process.pid+'.tmp';
   fs.writeFileSync(tmp,JSON.stringify({pid:process.pid,port,instance,store:storePath,
-    heartbeat:Math.floor(Date.now()/1000),state,message}),'utf8');
+    heartbeat:Math.floor(Date.now()/1000),state,message,reviewReturn:true}),'utf8');
   fs.renameSync(tmp,statusFile);
 }
 async function main() {

@@ -76,3 +76,16 @@ WHEN OLD.state='queued' AND NEW.state='submitting' AND EXISTS (
 ) BEGIN
     SELECT RAISE(IGNORE);
 END;
+
+-- One immutable request and at most one separately deliverable conclusion.
+CREATE TABLE IF NOT EXISTS review_requests (
+    request_id TEXT PRIMARY KEY REFERENCES mail(id),
+    conclusion_id TEXT UNIQUE REFERENCES mail(id),
+    closed_reason TEXT
+);
+CREATE TRIGGER IF NOT EXISTS validate_review_conclusion BEFORE UPDATE OF conclusion_id ON review_requests
+WHEN OLD.conclusion_id IS NOT NULL OR OLD.closed_reason IS NOT NULL OR NOT EXISTS (
+    SELECT 1 FROM mail q JOIN mail a ON a.binding_id=q.binding_id AND a.source<>q.source
+    JOIN bindings b ON b.id=q.binding_id AND b.active=1
+    WHERE q.id=OLD.request_id AND a.id=NEW.conclusion_id AND q.state<>'cancelled'
+) BEGIN SELECT RAISE(ABORT,'评审已关闭、已有结论或收发地址不匹配'); END;

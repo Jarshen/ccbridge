@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS continuity_notes(
  rev INTEGER PRIMARY KEY, root INTEGER NOT NULL, topic TEXT NOT NULL, kind TEXT NOT NULL,
  audience TEXT NOT NULL, body TEXT NOT NULL, evidence TEXT NOT NULL, binding_id INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS continuity_files(rev INTEGER PRIMARY KEY REFERENCES continuity_notes(rev),path TEXT NOT NULL,digest TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS continuity_sources(rev INTEGER PRIMARY KEY REFERENCES continuity_notes(rev),source TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS continuity_checks(ticket TEXT NOT NULL REFERENCES continuity_tickets(id),literal TEXT NOT NULL,
  PRIMARY KEY(ticket,literal));
 CREATE TABLE IF NOT EXISTS continuity_stage(ticket TEXT PRIMARY KEY REFERENCES continuity_tickets(id), boot TEXT NOT NULL);
@@ -42,9 +43,12 @@ def active(db, binding):
 
 def notes(db, root, side):
     return [dict(r) for r in db.execute("""
-        SELECT n.rev,topic,kind,audience,body,evidence,f.path,f.digest FROM continuity_notes n
+        SELECT n.rev,topic,kind,s.source,audience,body,evidence,f.path,f.digest FROM continuity_notes n
         LEFT JOIN continuity_files f ON f.rev=n.rev
-        WHERE root=? AND n.rev IN (SELECT max(rev) FROM continuity_notes WHERE root=? GROUP BY topic)
+        LEFT JOIN continuity_sources s ON s.rev=n.rev
+        WHERE root=? AND n.rev IN (
+          SELECT max(v.rev) FROM continuity_notes v LEFT JOIN continuity_sources a ON a.rev=v.rev
+          WHERE v.root=? GROUP BY v.topic,a.source,CASE WHEN a.source IS NOT NULL THEN v.kind END)
         AND (audience='both' OR audience=?) ORDER BY n.rev""", (root, root, side))]
 
 
@@ -80,6 +84,16 @@ def run(args):
                               detail=NULL WHERE id=?""", (status["instance"], args.ticket))
             return dict(db.execute("SELECT * FROM continuity_tickets WHERE id=?", (args.ticket,)).fetchone())
         route, root = active(db, args.binding)
+        if args.command=="close-review":
+            if not args.reason.strip():
+                raise ValueError("请记录该评审如何处置")
+            changed=db.execute("""UPDATE review_requests SET closed_reason=? WHERE request_id=?
+                AND conclusion_id IS NULL AND closed_reason IS NULL
+                AND EXISTS(SELECT 1 FROM mail WHERE id=request_id AND binding_id=?)""",
+                (args.reason,args.request_id,args.binding)).rowcount
+            if not changed:
+                raise ValueError("该配对没有对应的待回传评审")
+            return dict(request=args.request_id,closed_reason=args.reason)
         rev = revision(db, root)
         if args.command == "show":
             return dict(binding=args.binding, revision=rev, notes=notes(db, root, args.side))
@@ -88,9 +102,19 @@ def run(args):
                 raise ValueError(f"方向已更新到 {rev}，请先 show 再核对迟到结果")
             if not all(s.strip() for s in (args.topic, args.text, args.evidence)):
                 raise ValueError("需要事项、实际变化与可回查的依据")
+            source=args.source
+            if args.kind=="用户授权":
+                source=source or "用户"
+            if source and (args.kind.startswith("用户") and source!="用户"
+                           or args.kind in ("方案建议","模型推测","体验观察") and source=="用户"):
+                raise ValueError("决定类型与来源不一致，请按原话或证据核对")
+            if not source and args.kind in ("方案建议","体验观察"):
+                raise ValueError("请用 --source 指明判断来自 Opus 或 Astra")
             row = db.execute("""INSERT INTO continuity_notes(root,topic,kind,audience,body,evidence,binding_id)
                     VALUES(?,?,?,?,?,?,?)""", (root,args.topic,args.kind,args.audience,args.text,
                                                  args.evidence,args.binding))
+            if source:
+                db.execute("INSERT INTO continuity_sources VALUES(?,?)",(row.lastrowid,source))
             if args.file:
                 path = args.file.resolve(strict=True)
                 with path.open('rb') as src:
@@ -137,7 +161,8 @@ def main():
         if name == "note":
             cmd.add_argument("--base",type=int,required=True)
             cmd.add_argument("--topic",required=True)
-            cmd.add_argument("--kind",choices=["用户原话","用户局部认可","用户整体验收","模型推测","实测事实","未决"],required=True)
+            cmd.add_argument("--kind",choices=["用户原话","用户授权","用户局部认可","用户整体验收","方案建议","体验观察","模型推测","实测事实","未决"],required=True)
+            cmd.add_argument("--source",choices=["用户","Opus","Astra"],help="原始决定、建议或测量的来源，转述位置写入 evidence")
             cmd.add_argument("--audience",choices=["both","cc","desktop"],default="both")
             cmd.add_argument("--text",required=True)
             cmd.add_argument("--evidence",required=True)
@@ -150,6 +175,10 @@ def main():
             cmd.add_argument("--candidate",required=True)
             cmd.add_argument("--work",required=True)
             cmd.add_argument("--expect",action="append",default=[],help="可选的客观样品标识，要求候选答复含此值；不放入交接包")
+    close=commands.add_parser("close-review",help="核对后关闭尚无结论的评审，保留原信及处置理由")
+    close.add_argument("--binding",required=True,type=int)
+    close.add_argument("--request-id",required=True)
+    close.add_argument("--reason",required=True)
     for name in ("request","status","cancel"):
         cmd = commands.add_parser(name)
         cmd.add_argument("ticket")

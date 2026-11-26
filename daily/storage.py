@@ -128,6 +128,7 @@ class Store:
                     WHERE name='mail_new'
                 """)
                 db.execute("DROP TRIGGER IF EXISTS attach_pending_to_watch")
+                db.execute("DROP TRIGGER IF EXISTS validate_review_conclusion")
                 db.execute("DROP TABLE mail")
                 db.execute("ALTER TABLE mail_new RENAME TO mail")
             for statement in INDEXES_AND_TRIGGERS:
@@ -182,12 +183,15 @@ class Store:
         else:
             from receipts import enrich
         rows=self.messages()
-        if only_id:
-            rows=[m for m in rows if m['id']==only_id]
         return enrich(self,history_path,rows,only_id)
 
     @staticmethod
     def _retire(db, binding_id):
+        review=db.execute("""SELECT q.id FROM review_requests r JOIN mail q ON q.id=r.request_id
+            WHERE q.binding_id=? AND q.state<>'cancelled' AND r.conclusion_id IS NULL AND r.closed_reason IS NULL
+            LIMIT 1""",(binding_id,)).fetchone()
+        if review:
+            raise ValueError(f"评审 {review[0]} 尚待回传；请先核对结论或用 close-review 记录处置")
         pending = db.execute("""
             SELECT id, state FROM mail WHERE binding_id = ?
               AND state NOT IN ('queued', 'returned', 'cancelled', 'notified') ORDER BY seq LIMIT 1
@@ -238,10 +242,15 @@ class Store:
         return row["id"]
 
     def desktop_send(self, thread_id, text, request_id, reply_mode=None, *, expected_binding=None,
-                     handoff_turn=None, prefer_hook=False):
+                     handoff_turn=None, prefer_hook=False, review=False, review_to=None):
         """New letters are one-way. A retry of an older UUID keeps its stored envelope."""
         request_id = _uuid(request_id, "request_id")
         _text(text, "body")
+        if review and review_to:
+            raise ValueError("请选择发起评审或回传结论")
+        if review_to:
+            review_to = _uuid(review_to, "评审原信 ID")
+            text = f"评审结论〔{review_to}〕\n{text}"
         if reply_mode is not None and reply_mode not in REPLY_MODES:
             raise ValueError("reply_mode must be required, none, or deferred")
         if len(text) > 2500:
@@ -265,8 +274,18 @@ class Store:
                                (_uuid(handoff_turn,'turn'),binding_id))
                 db.execute("INSERT INTO mail(id, binding_id, source, body, reply_mode) VALUES (?, ?, 'desktop', ?, ?)",
                            (request_id, binding_id, text, "none"))
+                if review:
+                    db.execute("INSERT INTO review_requests(request_id) VALUES(?)", (request_id,))
+                if review_to and not db.execute("UPDATE review_requests SET conclusion_id=? WHERE request_id=?",
+                                                (request_id,review_to)).rowcount:
+                    raise ValueError("未知评审委托")
             elif (row["binding_id"], row["source"], row["body"]) != (binding_id, "desktop", text):
                 raise ValueError("Request ID already used for a different message or binding")
+            else:
+                original = db.execute("SELECT 1 FROM review_requests WHERE request_id=?", (request_id,)).fetchone()
+                parent = db.execute("SELECT request_id FROM review_requests WHERE conclusion_id=?", (request_id,)).fetchone()
+                if bool(original)!=review or (parent[0] if parent else None)!=review_to:
+                    raise ValueError("该编号的评审用途已改变")
         return request_id
 
     def desktop_reply(self, thread_id, mail_id, text):

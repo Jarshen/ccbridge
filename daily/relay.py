@@ -7,6 +7,7 @@ from pathlib import Path
 from contextlib import closing
 import sqlite3
 import sys
+import time
 
 
 def originating_turn(thread):
@@ -35,6 +36,9 @@ def main():
         if command == "send":
             sub.add_argument("--binding", type=int, required=True, help="Expected active binding ID")
             sub.add_argument("--follow", action="store_true", help="Send and keep receiving CC letters in this Desktop turn")
+            review=sub.add_mutually_exclusive_group()
+            review.add_argument("--review",action="store_true",help="委托 Claude 评审并回传结论")
+            review.add_argument("--review-to",metavar="原信UUID",help="向 Claude 回传指定评审委托的结论")
             sub.add_argument("--mode", choices=REPLY_MODES, help=argparse.SUPPRESS)
             sub.add_argument("--wait", type=int, choices=range(1,61), metavar="1..60",
                              help=argparse.SUPPRESS)
@@ -62,6 +66,13 @@ def main():
     if not path:
         path = Path(__file__).resolve().parent / "data" / "bridge.sqlite3"
     try:
+        if args.command=='send' and args.review:
+            marker=Path(path).resolve().with_name('status.json')
+            if marker.is_file():
+                live=json.loads(marker.read_text(encoding='utf8'))
+                if (live.get('state')=='ready' and Path(live.get('store','')).resolve()==Path(path).resolve()
+                        and abs(time.time()-live.get('heartbeat',0))<15 and not live.get('reviewReturn')):
+                    raise ValueError("当前运行的桥尚未载入评审回传；请在工作结束后正常重启，再发送本委托")
         store = Store(path)
         if from_cc:
             if __package__:
@@ -95,7 +106,8 @@ def main():
                         and (not from_cc or r['binding_id']==binding['id'])),None)
             if not found:
                 raise ValueError('本线程没有这个信件 ID 或错误编号的记录')
-            print(json.dumps({k:found[k] for k in ('id','binding_id','receipt','receipt_evidence','state','detail','next_action')}))
+            print(json.dumps({k:found[k] for k in ('id','binding_id','receipt','receipt_evidence','state','detail',
+                                                   'next_action','review_status','conclusion_id') if k in found}))
             return
         if args.command == "send":
             turn=originating_turn(thread)
@@ -105,7 +117,7 @@ def main():
                 if not turn or not enabled:
                     raise ValueError('--follow requires an active Desktop turn and an automatic one-way binding')
             mail_id = store.desktop_send(thread, args.text, args.id, expected_binding=args.binding,
-                                         handoff_turn=turn, prefer_hook=not args.follow)
+                                         handoff_turn=turn, prefer_hook=not args.follow,review=args.review,review_to=args.review_to)
             if args.wait or args.mode in ('required','deferred'):
                 print('Legacy reply options ignored. New mail is one-way. Use --follow to receive subsequent letters.', file=sys.stderr)
             try:

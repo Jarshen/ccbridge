@@ -76,6 +76,10 @@ export function handoffs({db,desktopDb,sessions,runtime,runRegistry,externalBusy
     return last;
   }
   function bridgeClear(b) {
+    if(exists('review_requests')) {
+      const review=db.prepare("SELECT q.id FROM review_requests r JOIN mail q ON q.id=r.request_id WHERE q.binding_id=? AND q.state<>'cancelled' AND r.conclusion_id IS NULL AND r.closed_reason IS NULL LIMIT 1").get(b.id);
+      if(review) fail('评审尚待回传 '+review.id+'，请核对或用 close-review 记录处置');
+    }
     const pending=db.prepare("SELECT id,state FROM mail WHERE binding_id=? AND state NOT IN ('returned','cancelled','notified') LIMIT 1").get(b.id);
     if (pending) fail('待处理原信 '+pending.id+' · '+pending.state);
     for (const [table,condition] of [

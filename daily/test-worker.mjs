@@ -998,3 +998,59 @@ test('pair instructions appear once; ordinary notifications contain only display
   assert.deepEqual(f.mail().map(m=>m.state),Array(2).fill(['notified','notified','returned','returned']).flat());
   assert.deepEqual([h.queued.length,h.requests.length],[6,6]);
 });
+
+function reviewRelay(f,thread,...args) {
+  return JSON.parse(execFileSync(python,['-B','-X','utf8','relay.py','--store',f.storePath,...args],
+    {cwd:daily,env:{...process.env,CODEX_THREAD_ID:thread,CODEX_HOME:path.dirname(f.storePath)},
+     encoding:'utf8',windowsHide:true,stdio:['ignore','pipe','pipe']}));
+}
+
+for(const explicit of [false,true]) test('review conclusion is correlated once and uses the ordinary return lane: '+explicit,async t=>{
+  const f=fixture(t),h=f.boot({makeSendServer:send=>({send})}),p=f.pair,req=randomUUID();
+  await h.turn(p,'setup');await h.tick();
+  const send=(...flags)=>reviewRelay(f,p.desktop,'send','--binding','1','--id',req,'--text','compare two samples',...flags);
+  send('--review');send('--review');assert.throws(()=>send());
+  const answer='Prefer the second sample; contrast is unresolved.';
+  if(explicit) h.onRequest=q=>{q.options.mcpServers.daily_pair.send(answer,42,false,req);};
+  h.answer=explicit?'The conclusion has been sent.':answer;
+  await h.tick();
+  assert.match(h.requests.at(-1).content,/共享评审/);
+  const rows=f.mail();assert.equal(rows.length,2);assert.equal(rows[1].source,'cc');
+  assert.equal(rows[1].body,'评审结论〔'+req+'〕\n'+answer);
+  const receipt=()=>reviewRelay(f,p.desktop,'receipt','--id',req);
+  assert.equal(receipt().conclusion_id,rows[1].id);assert.match(receipt().review_status,/待送达/);
+  const after=f.boot();await after.tick();await after.tick();
+  assert.equal(after.queued.filter(q=>q.prompt.includes(rows[1].id)).length,1);
+  assert.match(receipt().review_status,/待发起方读取/);
+  f.db.prepare('INSERT INTO delivery_evidence VALUES(?,?,CURRENT_TIMESTAMP)').run(rows[1].id,randomUUID());
+  assert.match(receipt().review_status,/结论已送达发起方/);
+});
+
+test('reverse review accepts only its partner, permits exact retry and rejects another conclusion',async t=>{
+  const f=fixture(t),h=f.boot({makeSendServer:send=>({send})});
+  let req;h.onRequest=q=>{req=q.options.mcpServers.daily_pair.send('Inspect the result',7,true);};
+  await h.turn(f.pair,'request a review');
+  assert.match(f.mail()[0].body,/--review-to/);
+  const second=f.session();
+  const answer=(thread,binding,id,target)=>reviewRelay(f,thread,'send','--binding',String(binding),'--id',id,
+    '--text','sample verified','--review-to',target);
+  assert.throws(()=>answer(second.desktop,2,randomUUID(),req));
+  assert.throws(()=>answer(f.pair.desktop,1,randomUUID(),randomUUID()));
+  const id=randomUUID();answer(f.pair.desktop,1,id,req);answer(f.pair.desktop,1,id,req);
+  assert.throws(()=>answer(f.pair.desktop,1,randomUUID(),req));
+  assert.equal(f.mail().length,2);
+});
+
+test('steered private final stays local and an unanswered review can be closed with its disposition',async t=>{
+  const f=fixture(t),h=f.boot(),p=f.pair,req=randomUUID();
+  await h.turn(p,'setup');await h.tick();
+  reviewRelay(f,p.desktop,'send','--binding','1','--id',req,'--text','inspect','--review');
+  h.raw=[{type:'user',isReplay:true,message:{role:'user',content:[{type:'text',text:'new local question'}]}}];
+  h.answer='local private text';await h.tick();
+  assert.equal(f.mail().length,1);
+  assert.match(reviewRelay(f,p.desktop,'receipt','--id',req).review_status,/待回传/);
+  assert.throws(()=>f.store('unbind',1));
+  execFileSync(python,['-B','-X','utf8','handoff.py','--store',f.storePath,'close-review','--binding','1','--request-id',req,'--reason','user withdrew request'],{cwd:daily,windowsHide:true});
+  assert.match(reviewRelay(f,p.desktop,'receipt','--id',req).review_status,/user withdrew/);
+  f.store('unbind',1);
+});

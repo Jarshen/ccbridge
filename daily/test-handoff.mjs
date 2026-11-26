@@ -127,3 +127,18 @@ test('aborted second readback cannot reuse the previous successful answer',t=>{
   assert.equal(f.status().readback,null);
   assert.throws(()=>f.request(),/候选 Claude/);
 });
+
+test('shared direction keeps authorization, recommendation and measurement independently through handoff',t=>{
+  const f=fixture(t);
+  let rev=1;
+  const note=(kind,source,text)=>f.cli('note','--binding','1','--base',String(rev),'--topic','contour',
+    '--kind',kind,'--source',source,'--text',text,'--evidence','native turn or measured sample').revision;
+  rev=note('用户授权','用户','continue refinement');rev=note('方案建议','Opus','try a smaller tip');
+  rev=note('实测事实','Astra','first measurement');rev=note('实测事实','Astra','verified measurement');
+  assert.throws(()=>note('用户授权','Opus','model suggestion'));
+  const packet=f.cli('prepare','--binding','1','--side','cc','--index',path.join(path.dirname(f.store),'index.sqlite'),
+    '--candidate',f.candidate,'--work','continue the comparison');
+  assert.deepEqual(packet.notes.filter(n=>n.topic==='contour').map(n=>[n.source,n.kind,n.body]),[
+    ['用户','用户授权','continue refinement'],['Opus','方案建议','try a smaller tip'],['Astra','实测事实','verified measurement']]);
+  assert.equal(packet.notes.find(n=>n.topic==='colour').source,null);
+});

@@ -213,6 +213,7 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
   const recordReceiver = db.prepare(`INSERT INTO receiver(binding_id,user_id,options) VALUES(?,?,?)
     ON CONFLICT(binding_id) DO UPDATE SET user_id=excluded.user_id, options=excluded.options`);
   const addMail = db.prepare("INSERT INTO mail(id,binding_id,source,body,reply_mode,state) VALUES(?,?,'cc',?,?,'queued')");
+  const reviewById=db.prepare('SELECT * FROM review_requests WHERE request_id=?');
   const set = db.prepare('UPDATE mail SET state=?,detail=? WHERE id=? AND state=?');
   const stillClaimed=db.prepare('SELECT 1 FROM mail WHERE id=? AND state=?');
   const recentTurn=db.prepare('SELECT turn_id FROM inbox_tool_turns WHERE binding_id=? AND seen_at>unixepoch()-60');
@@ -250,7 +251,7 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
   const seedReceiver=db.prepare(`INSERT OR IGNORE INTO receiver(binding_id,user_id,options) VALUES(?,?,?)`);
   const helper = '& '+quotePS(python)+' '+quotePS(relay)+' --store '+quotePS(storePath);
   const introduction = b => '给 Claude 发信：'+helper+' send --binding '+b.id+
-    ' --id <新UUID> --text <正文>。重试沿用原编号。'+pairRule;
+    ' --id <新UUID> --text <正文>。需要结论的评审加 --review；答复对方的评审加 --review-to <原信 UUID>。重试沿用原编号。'+pairRule;
 
   function validCC(binding) {
     const row = sessions.getSessionById(binding.cc);
@@ -294,7 +295,13 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
         return packet.id;
       }
       const id=randomUUID();
-      addMail.run(id,binding.id,packet.text,packet.mode);
+      let body=packet.text;
+      if (packet.review) body='评审委托〔'+id+'〕\n'+body+'\n请用 relay.py send --review-to '+id+' 回传简明结论。';
+      if (packet.reviewTo) body='评审结论〔'+packet.reviewTo+'〕\n'+body;
+      addMail.run(id,binding.id,shortText(body),packet.mode);
+      if (packet.review) db.prepare('INSERT INTO review_requests(request_id) VALUES(?)').run(id);
+      if (packet.reviewTo && !db.prepare('UPDATE review_requests SET conclusion_id=? WHERE request_id=?').run(id,packet.reviewTo).changes)
+        throw Error('未知评审委托');
       if(packet.mode==='none') {
         // The trigger offers only to the watch present at insertion. The
         // receiver checks native turn status before accepting the offer.
@@ -363,6 +370,18 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
       }
     }
     const wrapped={...context};
+    if(scope.reviewId && context.normalizeMessage) wrapped.normalizeMessage=(raw,sid)=>{
+      if((!raw.session_id || raw.session_id===binding.native_cc) && !raw.parent_tool_use_id) {
+        // A later local question can share the detached provider run. Only an
+        // explicitly addressed conclusion may leave that mixed conversation.
+        const parts=raw.message?.content;
+        const userInput=typeof parts==='string' ? parts : Array.isArray(parts) ?
+          parts.filter(p=>p.type==='text').map(p=>p.text).join('\n') : '';
+        if(raw.type==='attachment' || (raw.type==='user' && userInput && userInput!==scope.reviewPrompt))
+          scope.mixedInput=true;
+      }
+      return context.normalizeMessage(raw,sid);
+    };
     if(!scope.toolOnly && context.normalizeMessage) wrapped.normalizeMessage=(raw,sid)=>{
       const events=context.normalizeMessage(raw,sid);
       if(scope.done || raw.session_id!==binding.native_cc || raw.parent_tool_use_id || raw.parentToolUseId) return events;
@@ -384,12 +403,18 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
     const create=context.createQuery ?? query;
     if(makeSendServer && create) wrapped.createQuery=request=>{
       const instance=randomUUID();
-      const server=makeSendServer((body,requestId)=>{
+      const server=makeSendServer((body,requestId,review=false,reviewTo=null)=>{
         if(scope.done || !validCC(binding) || active.get(binding.cc)?.id!==binding.id)
           throw Error('配对或本次发件会话已结束');
         if(skip) throw Error('原信已登记，使用原信回执');
         const text=shortText(body);
-        const ids=registerOutput.immediate(binding,'tool:'+instance+':'+requestId,[{text,mode:'none'}],senderRoute(binding.id));
+        if (review && reviewTo) throw Error('请选择发起评审或回传结论');
+        if(scope.reviewId && reviewTo && reviewTo!==scope.reviewId && !scope.mixedInput)
+          throw Error('本轮评审结论须使用当前委托编号 '+scope.reviewId);
+        const packet={text,mode:'none'};
+        if (review) packet.review=true;
+        if (reviewTo || (scope.reviewId && !scope.mixedInput && !review)) packet.reviewTo=reviewTo || scope.reviewId;
+        const ids=registerOutput.immediate(binding,'tool:'+instance+':'+requestId,[packet],senderRoute(binding.id));
         sentByTool.add(text);
         return ids[0];
       });
@@ -560,10 +585,13 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
         else content='配对 Desktop 来信，请直接用自然语言回答对方的问题，回复由桥递送。';
         invoked=true;
         const route=senderRoute(binding.id);
+        const review=initial && reviewById.get(mail.id);
+        if(review) content+='\n【共享评审 '+mail.id+'】本回合的最终答复将回传 Astra。请只写可共享的推荐、依据和保留意见，控制在 2400 字内。也可调用 send 的 review_to 显式提交结论，普通通知和工具日志无需发送。';
         if(!notification) content+='\n'+envelope;
         const needsBrief=!briefed.get({binding:binding.id});
         if(needsBrief) content+='\n\n'+ccBrief;
-        const r=await ccTurn(binding,receiver,content,notification ? {route,related:mail.id} : {toolOnly:true});
+        const scope=review ? {route,reviewId:mail.id,reviewPrompt:content,toolOnly:true} : notification ? {route,related:mail.id} : {toolOnly:true};
+        const r=await ccTurn(binding,receiver,content,scope);
         if(!r.started && r.error===busyError) {set.run(mail.state,'等待 CC 空闲',mail.id,claimed);return 'busy';}
         if(!r.started) {set.run('failed',r.error || 'CC 回合未启动',mail.id,claimed);return;}
         if(r.error || !r.complete) throw Error(r.error || 'CC 回合完成情况未确认');
@@ -572,6 +600,19 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
         else if(mail.reply_mode==='none') {
           const ids=db.transaction(() => {
             if (!set.run('notified','CC 单向消息回合已完成',mail.id,claimed).changes) return;
+            if(review) {
+              const latest=reviewById.get(mail.id);
+              if(latest.conclusion_id || latest.closed_reason || scope.mixedInput) return;
+              try {
+                const packets=outbound(r.finalText,{allowProse:true});
+                if(packets.length>1 || packets[0]?.id) throw Error('请用 review_to 回传一份结论');
+                const answer=shortText(packets[0]?.text ?? r.finalText);
+                return enqueue(binding,[{text:answer,mode:'none',reviewTo:mail.id}],route);
+              } catch(error) {
+                notify(rejectPacket(binding,error,{related:mail.id,shown:true}));
+                return;
+              }
+            }
             return registerFinal(binding,r,route,mail.id);
           }).immediate();
           r.registered(ids);
