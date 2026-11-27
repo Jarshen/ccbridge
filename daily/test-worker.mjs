@@ -1054,3 +1054,54 @@ test('steered private final stays local and an unanswered review can be closed w
   assert.match(reviewRelay(f,p.desktop,'receipt','--id',req).review_status,/user withdrew/);
   f.store('unbind',1);
 });
+
+test('long shared final archives verbatim, returns one short letter and reports only matched successful material results',async t=>{
+  const f=fixture(t),h=f.boot(),p=f.pair,id=randomUUID();
+  await h.turn(p,'setup');await h.tick();
+  reviewRelay(f,p.desktop,'send','--binding','1','--id',id,'--text','compare the clip','--review');
+  const open=(key,name,input)=>({type:'assistant',message:{content:[{type:'tool_use',id:key,name,input}]}});
+  const done=(key,content,is_error=false)=>({type:'user',message:{content:[{type:'tool_result',tool_use_id:key,content,is_error}]}});
+  const img=[{type:'image',source:{type:'base64',data:'YQ=='}}];
+  h.raw=[open('a','Read',{file_path:'frame_008.png'}),done('a',img),
+    open('b','Read',{file_path:'unread.png'}),done('b',img,true),done('unmatched',img),
+    open('c','Bash',{command:'cd "samples" && start "" "motion.mp4"'}),done('c',''),
+    open('d','Bash',{command:'echo start "" "pretend.mp4"'}),done('d',''),
+    open('e','Read',{file_path:'metrics.txt'}),done('e','1\tmeasured at 30 fps')];
+  const full='推荐：保留乙。\n依据：边缘清楚。\n'+'其他细节🌱。'.repeat(750)+'\n保留意见：原速未核验。';
+  h.answer=full;
+  await h.tick();
+  const letters=f.mail();assert.equal(letters.length,2);
+  const wire=letters[1].body;
+  for(const expected of ['保留乙','边缘清楚','原速未核验','review_report.py',id,'frame_008.png','播放器启动命令成功']) assert.ok(wire.includes(expected),expected);
+  assert.ok(Array.from(wire).length<2500);
+  const report=key=>JSON.parse(execFileSync(python,['-B','-X','utf8','review_report.py','--store',f.storePath,'--binding','1','--id',key],{cwd:daily,encoding:'utf8'}));
+  assert.equal(report(letters[1].id).full_text,full);
+  assert.deepEqual(report(id).materials,[['已返回静帧图像','frame_008.png'],['播放器启动命令成功','motion.mp4'],['已返回文件文本','metrics.txt']]);
+  for(const key of [id,letters[1].id]){
+    const receipt=reviewRelay(f,p.desktop,'receipt','--id',key);
+    assert.equal(receipt.full_text_available,true);assert.equal(receipt.review_materials.length,3);
+    assert.ok(receipt.receipt_evidence.includes('frame_008.png'));
+  }
+  const next=f.boot();await next.tick();await next.tick();
+  assert.equal(f.mail().length,2);assert.equal(next.queued.filter(q=>q.prompt.includes(letters[1].id)).length,1);
+});
+
+test('explicit long send and reverse file review preserve full reports and reject conflicting retries',async t=>{
+  const f=fixture(t),h=f.boot({makeSendServer:send=>({send})}),p=f.pair,id=randomUUID();
+  await h.turn(p,'setup');await h.tick();
+  reviewRelay(f,p.desktop,'send','--binding','1','--id',id,'--text','compare','--review');
+  const full='A shared paragraph with details.\n'.repeat(180)+'final caveat';
+  h.onRequest=q=>q.options.mcpServers.daily_pair.send(full,2,false,id,'Keep B; edge clear; timing open.');
+  await h.tick();
+  assert.equal(f.mail().length,2);
+  assert.ok(f.mail()[1].body.includes('Keep B; edge clear; timing open.'));
+  assert.equal(f.db.prepare('SELECT full_text FROM review_reports WHERE request_id=?').get(id).full_text,full);
+  let request;h.onRequest=q=>{request=q.options.mcpServers.daily_pair.send('compare next',3,true);};
+  await h.turn(p,'start review');
+  const file=path.join(path.dirname(f.storePath),'final.txt');fs.writeFileSync(file,full);
+  const reply=randomUUID();
+  const send=()=>reviewRelay(f,p.desktop,'send','--binding','1','--id',reply,'--text-file',file,'--review-to',request,'--summary','Keep A; timing pending.');
+  send();send();
+  assert.equal(f.db.prepare('SELECT full_text FROM review_reports WHERE request_id=?').get(request).full_text,full);
+  fs.writeFileSync(file,full+' correction');assert.throws(send);
+});

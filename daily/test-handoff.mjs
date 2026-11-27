@@ -142,3 +142,25 @@ test('shared direction keeps authorization, recommendation and measurement indep
     ['用户','用户授权','continue refinement'],['Opus','方案建议','try a smaller tip'],['Astra','实测事实','verified measurement']]);
   assert.equal(packet.notes.find(n=>n.topic==='colour').source,null);
 });
+
+test('focus replaces history in both packets, preserves live constraints, version guards and historical lookup',async t=>{
+  const f=fixture(t);let rev=1;
+  rev=f.note(rev,'trial A','old test').revision;
+  rev=f.note(rev,'trial B','abandoned').revision;
+  const focus=base=>f.cli('focus','--binding','1','--base',String(base),'--adopted','released passive variant',
+    '--closed','A and B closed','--next-step','mouth only','--keep','1','--evidence','user decision and release report');
+  assert.throws(()=>focus(1));
+  const selected=focus(rev);rev=selected.revision;
+  assert.equal(f.cli('show','--binding','1','--side','desktop').overview.next_step,'mouth only');
+  const scope=['prepare','--binding','1','--index',path.join(path.dirname(f.store),'index.sqlite'),'--candidate',f.candidate,'--work','verify mouth'];
+  for(const side of ['cc','desktop']){
+    const packet=f.cli(...scope,'--side',side);
+    assert.equal(packet.overview.adopted,'released passive variant');assert.equal(packet.overview.closed,'A and B closed');
+    assert.deepEqual(packet.notes.map(n=>n.topic),['colour']);assert.match(packet.history,/--history --through/);
+  }
+  f.note(rev,'new evidence','verified after focus');
+  const view=f.cli('show','--binding','1','--side','cc');
+  assert.deepEqual(view.notes.map(n=>n.topic),['colour','new evidence']);
+  const archived=f.cli('show','--binding','1','--side','cc','--history','--through',String(rev));
+  assert.deepEqual(archived.notes.map(n=>n.topic),['colour','trial A','trial B']);assert.equal(archived.overviews.length,1);
+});

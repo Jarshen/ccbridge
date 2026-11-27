@@ -242,18 +242,20 @@ class Store:
         return row["id"]
 
     def desktop_send(self, thread_id, text, request_id, reply_mode=None, *, expected_binding=None,
-                     handoff_turn=None, prefer_hook=False, review=False, review_to=None):
+                     handoff_turn=None, prefer_hook=False, review=False, review_to=None, summary=None):
         """New letters are one-way. A retry of an older UUID keeps its stored envelope."""
         request_id = _uuid(request_id, "request_id")
         _text(text, "body")
         if review and review_to:
             raise ValueError("请选择发起评审或回传结论")
+        full=text
+        if summary is not None and not review_to:
+            raise ValueError("摘要仅用于已关联的评审结论")
         if review_to:
             review_to = _uuid(review_to, "评审原信 ID")
-            text = f"评审结论〔{review_to}〕\n{text}"
         if reply_mode is not None and reply_mode not in REPLY_MODES:
             raise ValueError("reply_mode must be required, none, or deferred")
-        if len(text) > 2500:
+        if not review_to and len(text) > 2500:
             raise ValueError("单封信最多 2500 字，请改发文件路径和版本")
         with self._write() as db:
             binding_id = self._origin(db, thread_id)
@@ -261,6 +263,16 @@ class Store:
                 raise ValueError("Expected binding is no longer active for this Desktop thread")
             row = db.execute("SELECT binding_id, source, body FROM mail WHERE id = ?",
                              (request_id,)).fetchone()
+            if review_to:
+                if __package__:
+                    from .review_report import letter
+                else:
+                    from review_report import letter
+                saved=db.execute("SELECT full_text FROM review_reports WHERE request_id=?",(review_to,)).fetchone()
+                if row and saved and saved[0]!=full:
+                    raise ValueError("同一评审重试的全文已改变")
+                text=(f"评审结论〔{review_to}〕\n{full}" if row and not saved else
+                      letter(full,review_to,self.path,binding_id,summary=summary))
             if row is None:
                 if prefer_hook and handoff_turn and db.execute(
                         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='inbox_tool_turns'").fetchone():
@@ -279,6 +291,8 @@ class Store:
                 if review_to and not db.execute("UPDATE review_requests SET conclusion_id=? WHERE request_id=?",
                                                 (request_id,review_to)).rowcount:
                     raise ValueError("未知评审委托")
+                if review_to:
+                    db.execute("INSERT INTO review_reports VALUES(?,?)",(review_to,full))
             elif (row["binding_id"], row["source"], row["body"]) != (binding_id, "desktop", text):
                 raise ValueError("Request ID already used for a different message or binding")
             else:

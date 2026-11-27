@@ -43,7 +43,13 @@ def main():
             sub.add_argument("--wait", type=int, choices=range(1,61), metavar="1..60",
                              help=argparse.SUPPRESS)
         sub.add_argument("--id", required=True, help=help_text)
-        sub.add_argument("--text", required=True, help="Message text")
+        if command=="send":
+            sub.add_argument("--summary",help="评审推荐、依据和保留意见；全文由 --text 或 --text-file 提供")
+            body=sub.add_mutually_exclusive_group(required=True)
+            body.add_argument("--text")
+            body.add_argument("--text-file",type=Path,help="UTF-8 正文")
+        else:
+            sub.add_argument("--text",required=True)
     confirm = commands.add_parser("confirm", help="Confirm receipt of the reply to a Desktop request")
     confirm.add_argument("--id", required=True, help="UUID of the original Desktop request")
     lookup=commands.add_parser('receipt',help='Look up a paired letter or failed send by its ID.')
@@ -107,7 +113,8 @@ def main():
             if not found:
                 raise ValueError('本线程没有这个信件 ID 或错误编号的记录')
             print(json.dumps({k:found[k] for k in ('id','binding_id','receipt','receipt_evidence','state','detail',
-                                                   'next_action','review_status','conclusion_id') if k in found}))
+                                                   'next_action','review_status','conclusion_id','review_materials',
+                                                   'full_text_available') if k in found}))
             return
         if args.command == "send":
             turn=originating_turn(thread)
@@ -116,8 +123,10 @@ def main():
                     enabled=db.execute('SELECT 1 FROM auto_inboxes WHERE binding_id=?',(args.binding,)).fetchone()
                 if not turn or not enabled:
                     raise ValueError('--follow requires an active Desktop turn and an automatic one-way binding')
-            mail_id = store.desktop_send(thread, args.text, args.id, expected_binding=args.binding,
-                                         handoff_turn=turn, prefer_hook=not args.follow,review=args.review,review_to=args.review_to)
+            body=args.text_file.read_text(encoding='utf-8-sig') if args.text_file else args.text
+            mail_id = store.desktop_send(thread, body, args.id, expected_binding=args.binding,
+                                         handoff_turn=turn, prefer_hook=not args.follow,review=args.review,review_to=args.review_to,
+                                         summary=args.summary)
             if args.wait or args.mode in ('required','deferred'):
                 print('Legacy reply options ignored. New mail is one-way. Use --follow to receive subsequent letters.', file=sys.stderr)
             try:

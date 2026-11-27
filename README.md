@@ -46,7 +46,11 @@ codex mcp add daily_pair_inbox -- $python -B -X utf8 $inbox serve
 - **Claude → Desktop** 可在 Claude 输入 **新建 Desktop 配对**，在打开的 Desktop 草稿中发送预填首信。桥核对项目目录和申请号后绑定。可在 Claude 输入 **取消 Desktop 配对申请**。
 - 需要核对前端版本时运行 `py -3 daily/launcher.py --verify-frontend`。新安装默认打开随源码校验的新版首页。手动回滚可用 `--rollback-frontend`，重新启用可用 `--promote-frontend <发布的SHA256>`。[发布摘要](daily/release-frontend.json)
 
+长评审可发送摘要、保留全文。用原委托或结论编号运行 `daily/review_report.py`，可核对实际投递的信、共享全文和当轮返回的材料。[评审材料与全文](daily/换新说明.md#共享评审的材料与全文)
+
 ## 单侧换新
+
+用户裁决后，用 `daily/handoff.py focus` 更新现行方案、已结案事项和下一步，用 `--keep` 保留仍适用的约束和样品。[交接首页用法](daily/换新说明.md#裁决后的交接首页)
 
 需要更换配对中的一端时，可记录已确认的方向、证据和未完事项，由新会话核对材料后接管；另一端沿用原聊天。只有交接状态为 `committed` 才算完成。[单侧换新说明](daily/换新说明.md)
 

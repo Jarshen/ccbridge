@@ -89,3 +89,13 @@ WHEN OLD.conclusion_id IS NOT NULL OR OLD.closed_reason IS NOT NULL OR NOT EXIST
     JOIN bindings b ON b.id=q.binding_id AND b.active=1
     WHERE q.id=OLD.request_id AND a.id=NEW.conclusion_id AND q.state<>'cancelled'
 ) BEGIN SELECT RAISE(ABORT,'评审已关闭、已有结论或收发地址不匹配'); END;
+
+CREATE TABLE IF NOT EXISTS review_reports (
+    request_id TEXT PRIMARY KEY REFERENCES review_requests(request_id),
+    full_text TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS review_materials (
+    request_id TEXT NOT NULL REFERENCES review_requests(request_id),
+    kind TEXT NOT NULL, name TEXT NOT NULL,
+    PRIMARY KEY(request_id,kind,name)
+);

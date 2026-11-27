@@ -29,10 +29,17 @@ def matches(item_json, mail):
 
 def enrich(store, history_path, rows, only_id=None):
     with closing(store._connect()) as db:
-        reviews=db.execute('SELECT request_id,conclusion_id,closed_reason FROM review_requests WHERE ? IS NULL OR request_id=?',
-                           (only_id,only_id)).fetchall()
+        reviews=db.execute("""SELECT r.request_id,r.conclusion_id,r.closed_reason,d.request_id IS NOT NULL
+            FROM review_requests r LEFT JOIN review_reports d ON d.request_id=r.request_id
+            WHERE ? IS NULL OR r.request_id=? OR r.conclusion_id=?""",
+                           (only_id,only_id,only_id)).fetchall()
+        evidence_by_request={}
+        for key,kind,name in db.execute("""SELECT r.request_id,m.kind,m.name FROM review_requests r
+                JOIN review_materials m ON m.request_id=r.request_id
+                WHERE ? IS NULL OR r.request_id=? OR r.conclusion_id=? ORDER BY m.rowid""",(only_id,only_id,only_id)):
+            evidence_by_request.setdefault(key,[]).append(dict(kind=kind,name=name))
         if only_id:
-            selected={only_id,*(r[1] for r in reviews)}
+            selected={only_id,*(r[0] for r in reviews),*(r[1] for r in reviews)}
             rows=[m for m in rows if m['id'] in selected]
         saved = dict(db.execute('SELECT mail_id,turn_id FROM delivery_evidence'))
         has_inbox = db.execute("SELECT 1 FROM sqlite_master WHERE name='paired_letters'").fetchone()
@@ -91,7 +98,7 @@ def enrich(store, history_path, rows, only_id=None):
                              reply=None,reply_mode='none',created=f['created'],cc=f['cc'],desktop=f['desktop'],
                              cc_title=f['cc_title'],desktop_title=f['desktop_title']))
         by_id={r['id']:r for r in rows}
-        for key,result,closed in reviews:
+        for key,result,closed,archived in reviews:
             request=by_id.get(key)
             if not request:
                 continue
@@ -118,6 +125,15 @@ def enrich(store, history_path, rows, only_id=None):
                 action='可继续独立工作，等待评审结论。'
             request.update(review_status=label,conclusion_id=result,next_action=action)
             request['receipt_evidence']+=' · '+label
+            materials=evidence_by_request.get(key,[])
+            for item in (request,by_id.get(result)):
+                if item is None:
+                    continue
+                item.update(review_materials=materials,full_text_available=bool(archived))
+                if materials:
+                    item['receipt_evidence']+='\n本回合材料：'+'；'.join(m['kind']+' · '+m['name'] for m in materials)
+                elif archived:
+                    item['receipt_evidence']+='\n本回合无可核对的图像或播放器工具回执。'
         if only_id:
             rows=[r for r in rows if r['id']==only_id]
     for row in rows:

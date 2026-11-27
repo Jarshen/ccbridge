@@ -1,6 +1,7 @@
 import path from 'node:path';
 import {createHash,randomUUID} from 'node:crypto';
-import {execFile} from 'node:child_process';
+import {execFile,execFileSync} from 'node:child_process';
+import {observeReviewMaterials} from './review-materials.mjs';
 import {readFileSync} from 'node:fs';
 import {promisify} from 'node:util';
 import {fileURLToPath} from 'node:url';
@@ -90,7 +91,7 @@ export function parseOutboundPacket(raw, allowQuotedProse=false) {
   }
 }
 
-function outbound(text, {allowProse=false}={}) {
+function outbound(text, {allowProse=false,reviewText=false}={}) {
   if(typeof text!=='string') return [];
   const lines=text.trimEnd().split(/\r?\n/);
   const marker=/^ASTRA(?:-REPLY)?(?=[ \t]|$)/;
@@ -111,12 +112,12 @@ function outbound(text, {allowProse=false}={}) {
   }
   if(fence || start<0) return [];
   return lines.slice(start).map((line,index)=>{
-    try {return readOutboundLine(line,allowProse);}
+    try {return readOutboundLine(line,allowProse,reviewText);}
     catch(error) {throw Error('第 '+(index+1)+' 个信封（答复第 '+(start+index+1)+' 行）：'+error.message);}
   });
 }
 
-function readOutboundLine(line,allowProse) {
+function readOutboundLine(line,allowProse,reviewText=false) {
   const prefix=line.startsWith('ASTRA-REPLY')?'ASTRA-REPLY':'ASTRA';
   let packet;
   try {packet=parseOutboundPacket(line.slice(prefix.length),allowProse && prefix==='ASTRA');}
@@ -135,7 +136,7 @@ function readOutboundLine(line,allowProse) {
   if(mode!==undefined && mode!==reply_mode)
     throw Error('ASTRA mode 与 reply_mode 冲突');
   if(!['required','none','deferred'].includes(reply_mode)) throw Error('ASTRA reply_mode 无效');
-  return {mode:'none',text:shortText(packet?.text)};
+  return {mode:'none',text:reviewText ? packet.text : shortText(packet?.text)};
 }
 
 // A provider can keep its writer open for background activity after the terminal event.
@@ -214,6 +215,10 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
     ON CONFLICT(binding_id) DO UPDATE SET user_id=excluded.user_id, options=excluded.options`);
   const addMail = db.prepare("INSERT INTO mail(id,binding_id,source,body,reply_mode,state) VALUES(?,?,'cc',?,?,'queued')");
   const reviewById=db.prepare('SELECT * FROM review_requests WHERE request_id=?');
+  const addMaterial=db.prepare(`INSERT OR IGNORE INTO review_materials(request_id,kind,name)
+    SELECT request_id,?,? FROM review_requests WHERE request_id=? AND conclusion_id IS NULL AND closed_reason IS NULL`);
+  const materialsFor=db.prepare('SELECT kind,name FROM review_materials WHERE request_id=? ORDER BY rowid').raw();
+  const reportHelper=fileURLToPath(new URL('./review_report.py',import.meta.url));
   const set = db.prepare('UPDATE mail SET state=?,detail=? WHERE id=? AND state=?');
   const stillClaimed=db.prepare('SELECT 1 FROM mail WHERE id=? AND state=?');
   const recentTurn=db.prepare('SELECT turn_id FROM inbox_tool_turns WHERE binding_id=? AND seen_at>unixepoch()-60');
@@ -297,11 +302,20 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
       const id=randomUUID();
       let body=packet.text;
       if (packet.review) body='评审委托〔'+id+'〕\n'+body+'\n请用 relay.py send --review-to '+id+' 回传简明结论。';
-      if (packet.reviewTo) body='评审结论〔'+packet.reviewTo+'〕\n'+body;
+      if (packet.reviewTo) {
+        if(typeof body!=='string' || !body.trim()) throw Error('评审正文为空');
+        const materials=materialsFor.all(packet.reviewTo);
+        if(!materials.length && !packet.summary && Array.from(body.trim()).length<=1200)
+          body='评审结论〔'+packet.reviewTo+'〕\n'+body.trim();
+        else body=JSON.parse(execFileSync(python,['-B','-X','utf8',reportHelper,'--format'],{
+          windowsHide:true,encoding:'utf8',input:JSON.stringify({full:body,request:packet.reviewTo,
+            store:storePath,binding:binding.id,materials,summary:packet.summary})}));
+      }
       addMail.run(id,binding.id,shortText(body),packet.mode);
       if (packet.review) db.prepare('INSERT INTO review_requests(request_id) VALUES(?)').run(id);
       if (packet.reviewTo && !db.prepare('UPDATE review_requests SET conclusion_id=? WHERE request_id=?').run(id,packet.reviewTo).changes)
         throw Error('未知评审委托');
+      if(packet.reviewTo) db.prepare('INSERT INTO review_reports(request_id,full_text) VALUES(?,?)').run(packet.reviewTo,packet.text);
       if(packet.mode==='none') {
         // The trigger offers only to the watch present at insertion. The
         // receiver checks native turn status before accepting the offer.
@@ -370,6 +384,7 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
       }
     }
     const wrapped={...context};
+    const observeMaterial=scope.reviewId && observeReviewMaterials((kind,name)=>addMaterial.run(kind,name,scope.reviewId));
     if(scope.reviewId && context.normalizeMessage) wrapped.normalizeMessage=(raw,sid)=>{
       if((!raw.session_id || raw.session_id===binding.native_cc) && !raw.parent_tool_use_id) {
         // A later local question can share the detached provider run. Only an
@@ -379,6 +394,7 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
           parts.filter(p=>p.type==='text').map(p=>p.text).join('\n') : '';
         if(raw.type==='attachment' || (raw.type==='user' && userInput && userInput!==scope.reviewPrompt))
           scope.mixedInput=true;
+        if(!scope.mixedInput && !scope.done) observeMaterial(raw);
       }
       return context.normalizeMessage(raw,sid);
     };
@@ -403,17 +419,20 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
     const create=context.createQuery ?? query;
     if(makeSendServer && create) wrapped.createQuery=request=>{
       const instance=randomUUID();
-      const server=makeSendServer((body,requestId,review=false,reviewTo=null)=>{
+      const server=makeSendServer((body,requestId,review=false,reviewTo=null,summary=null)=>{
         if(scope.done || !validCC(binding) || active.get(binding.cc)?.id!==binding.id)
           throw Error('配对或本次发件会话已结束');
         if(skip) throw Error('原信已登记，使用原信回执');
-        const text=shortText(body);
+        const target=reviewTo || (scope.reviewId && !scope.mixedInput && !review ? scope.reviewId : null);
+        if(summary && !target) throw Error('摘要仅用于评审结论');
+        const text=target ? body : shortText(body);
         if (review && reviewTo) throw Error('请选择发起评审或回传结论');
         if(scope.reviewId && reviewTo && reviewTo!==scope.reviewId && !scope.mixedInput)
           throw Error('本轮评审结论须使用当前委托编号 '+scope.reviewId);
         const packet={text,mode:'none'};
         if (review) packet.review=true;
-        if (reviewTo || (scope.reviewId && !scope.mixedInput && !review)) packet.reviewTo=reviewTo || scope.reviewId;
+        if (target) packet.reviewTo=target;
+        if (summary) packet.summary=summary;
         const ids=registerOutput.immediate(binding,'tool:'+instance+':'+requestId,[packet],senderRoute(binding.id));
         sentByTool.add(text);
         return ids[0];
@@ -586,7 +605,7 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
         invoked=true;
         const route=senderRoute(binding.id);
         const review=initial && reviewById.get(mail.id);
-        if(review) content+='\n【共享评审 '+mail.id+'】本回合的最终答复将回传 Astra。请只写可共享的推荐、依据和保留意见，控制在 2400 字内。也可调用 send 的 review_to 显式提交结论，普通通知和工具日志无需发送。';
+        if(review) content+='\n【共享评审 '+mail.id+'】最终答复自动保存共享全文并回传一次。请先各用一句写“推荐”“依据”“保留意见”，再写必要细节；也可用 send 的 review_to 显式提交，text 放全文，summary 放短结论。谈动作先后、时码或像素差时引用实际返回的帧或测量；播放器启动只说明尝试播放。';
         if(!notification) content+='\n'+envelope;
         const needsBrief=!briefed.get({binding:binding.id});
         if(needsBrief) content+='\n\n'+ccBrief;
@@ -604,9 +623,9 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
               const latest=reviewById.get(mail.id);
               if(latest.conclusion_id || latest.closed_reason || scope.mixedInput) return;
               try {
-                const packets=outbound(r.finalText,{allowProse:true});
+                const packets=outbound(r.finalText,{allowProse:true,reviewText:true});
                 if(packets.length>1 || packets[0]?.id) throw Error('请用 review_to 回传一份结论');
-                const answer=shortText(packets[0]?.text ?? r.finalText);
+                const answer=packets[0]?.text ?? r.finalText;
                 return enqueue(binding,[{text:answer,mode:'none',reviewTo:mail.id}],route);
               } catch(error) {
                 notify(rejectPacket(binding,error,{related:mail.id,shown:true}));
@@ -725,7 +744,7 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
     }
     const notes=handoff ? '\n仅在方向、反馈或证据发生变化时，代用户用 '+quotePS(fileURLToPath(new URL('./handoff.py',import.meta.url)))+
       ' --store '+quotePS(storePath)+' show --binding '+binding.id+' --side '+recipient+
-      ' 查看有效方向，note --help 可查增量记录方式。保留用户原话、局部认可和样品版本。方向改变要给搭档发一次短消息。' : '';
+      ' 查看有效方向。note 记录用户原话、局部认可和证据。用户裁决、结案或转向时，由代理用 focus 更新现行方案、已结案和下一步，以 --keep 保留仍有效的约束与样品依据。方向改变要给搭档发一次短消息。' : '';
     const brief=readPairingBrief(binding,recipient)+notes+(handoff?.notice(binding.id) || '');
     if(!claimNotice.run(binding.id,recipient).changes) return;
     try {

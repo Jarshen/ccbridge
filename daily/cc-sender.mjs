@@ -6,11 +6,12 @@ export async function claudeSender(require) {
   function makeSendServer(send) {
     return createSdkMcpServer({name:'daily_pair',tools:[tool('send',
       '给 Astra 发信。需要 Astra 评审并回传时设置 review；回传已有评审用 review_to 填原信编号。工具成功后无需再写 ASTRA 信封。',
-      {text:z.string(),review:z.boolean().optional(),review_to:z.string().uuid().optional()},async ({text,review,review_to},extra)=>{
+      {text:z.string(),review:z.boolean().optional(),review_to:z.string().uuid().optional(),
+       summary:z.string().optional().describe('长评审的推荐、依据、保留意见；text 放完整共享原文')},async ({text,review,review_to,summary},extra)=>{
         try {
           if(typeof extra?.requestId!=='number' && typeof extra?.requestId!=='string')
             throw Error('工具请求缺少编号');
-          const id=send(text,extra.requestId,review,review_to);
+          const id=send(text,extra.requestId,review,review_to,summary);
           return {content:[{type:'text',text:'已登记 · '+id}]};
         } catch(error) {
           return {isError:true,content:[{type:'text',text:error.message}]};
