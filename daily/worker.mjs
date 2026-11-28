@@ -2,6 +2,7 @@ import path from 'node:path';
 import {createHash,randomUUID} from 'node:crypto';
 import {execFile,execFileSync} from 'node:child_process';
 import {observeReviewMaterials} from './review-materials.mjs';
+import {ccProgress} from './cc-progress.mjs';
 import {readFileSync} from 'node:fs';
 import {promisify} from 'node:util';
 import {fileURLToPath} from 'node:url';
@@ -255,6 +256,9 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
   const finishNotice=db.prepare(`UPDATE pairing_notices SET state=?,detail=? WHERE binding_id=? AND recipient=? AND state='sending'`);
   const seedReceiver=db.prepare(`INSERT OR IGNORE INTO receiver(binding_id,user_id,options) VALUES(?,?,?)`);
   const helper = '& '+quotePS(python)+' '+quotePS(relay)+' --store '+quotePS(storePath);
+  const notesHelper='& '+quotePS(python)+' '+quotePS(fileURLToPath(new URL('./handoff.py',import.meta.url)))+
+    ' --store '+quotePS(storePath);
+  const progress=ccProgress(db,id=>notesHelper+' show --binding '+id+' --side cc --progress');
   const introduction = b => '给 Claude 发信：'+helper+' send --binding '+b.id+
     ' --id <新UUID> --text <正文>。需要结论的评审加 --review；答复对方的评审加 --review-to <原信 UUID>。重试沿用原编号。'+pairRule;
 
@@ -476,7 +480,7 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
     const observe=observeTurn();
     const route=senderRoute(binding.id);
     const needsBrief=!briefed.get({binding:binding.id});
-    let direct, prompt=command, deliveryError, completed=false;
+    let direct, prompt=command, deliveryError, completed=false, batch;
     const send = writer.send;
     function report(error,modelOutput='') {
       send.call(writer,{kind:'error',provider:'claude',sessionId:opts.sessionId,
@@ -490,6 +494,10 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
         prompt=command+'\n\n【本机配对桥状态】'+ids.join('、')+' 已在本机登记。请简短告知用户，入队不代表对方已读。';
       }
       if(needsBrief) prompt+='\n\n'+ccBrief;
+      if(!direct.length && typeof command==='string' && command.trim() && !command.trimStart().startsWith('/')) {
+        batch=progress.snapshot(binding);
+        if(batch) prompt+='\n\n'+batch.text;
+      }
     } catch(error) {
       report(error);
       throw error;
@@ -518,11 +526,17 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
       const result=await previous(prompt,opts,writer,sendingContext({...context,createQuery:context.createQuery ?? query},binding,scope,writer));
       if(needsBrief && completed) recordBrief.run(binding.id);
       if(deliveryError) throw deliveryError;
+      if(completed) progress.complete(binding,batch);
       return result;
     } finally { scope.done=true;writer.send=send;handoff?.changedSession(opts.sessionId); }
   };
 
   async function ccTurn(binding,receiver,prompt,scope={toolOnly:true}) {
+    const batch=scope.carryProgress && progress.snapshot(binding);
+    if(batch) {
+      prompt+='\n\n'+batch.text;
+      if(scope.reviewId) scope.reviewPrompt=prompt;
+    }
     let final,showStatus;
     const observe=observeTurn();
     const observed=Object.create(runtime);
@@ -540,6 +554,7 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
     };
     const result=await detached({sessionId:binding.cc,userId:receiver.user_id,content:prompt,
       options:JSON.parse(receiver.options),interruptActiveRun:false},{runtime:observed});
+    if(result.started && !result.error && final) progress.complete(binding,batch);
     return {...result,complete:!!final,finalText:final?.text,sdkHandled:scope?.handled,registered(ids) {
       if(!ids?.length) return;
       try {showStatus?.('已登记 · '+ids.join('、'));}
@@ -610,6 +625,7 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
         const needsBrief=!briefed.get({binding:binding.id});
         if(needsBrief) content+='\n\n'+ccBrief;
         const scope=review ? {route,reviewId:mail.id,reviewPrompt:content,toolOnly:true} : notification ? {route,related:mail.id} : {toolOnly:true};
+        scope.carryProgress=initial;
         const r=await ccTurn(binding,receiver,content,scope);
         if(!r.started && r.error===busyError) {set.run(mail.state,'等待 CC 空闲',mail.id,claimed);return 'busy';}
         if(!r.started) {set.run('failed',r.error || 'CC 回合未启动',mail.id,claimed);return;}
@@ -742,10 +758,10 @@ export function installWorker({db, desktopDb, sessions, provider, runtime, runRe
         receiver=getReceiver.get(binding.id);
       }
     }
-    const notes=handoff ? '\n仅在方向、反馈或证据发生变化时，代用户用 '+quotePS(fileURLToPath(new URL('./handoff.py',import.meta.url)))+
-      ' --store '+quotePS(storePath)+' show --binding '+binding.id+' --side '+recipient+
+    const notes=handoff ? '\n仅在方向、反馈或证据发生变化时，代用户用 '+notesHelper+' show --binding '+binding.id+' --side '+recipient+
       ' 查看有效方向。note 记录用户原话、局部认可和证据。用户裁决、结案或转向时，由代理用 focus 更新现行方案、已结案和下一步，以 --keep 保留仍有效的约束与样品依据。方向改变要给搭档发一次短消息。' : '';
-    const brief=readPairingBrief(binding,recipient)+notes+(handoff?.notice(binding.id) || '');
+    const quiet=handoff && recipient==='desktop' ? '\n只需同步的进度可在 note 上加 --next-cc，留到下次 Claude 业务回合。会改变眼下判断的纠正仍立即发信。' : '';
+    const brief=readPairingBrief(binding,recipient)+notes+quiet+(handoff?.notice(binding.id) || '');
     if(!claimNotice.run(binding.id,recipient).changes) return;
     try {
       if(recipient==='cc') {

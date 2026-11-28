@@ -50,6 +50,8 @@ codex mcp add daily_pair_inbox -- $python -B -X utf8 $inbox serve
 
 ## 单侧换新
 
+普通进度可用 `handoff.py note --next-cc` 留给 Claude 的下一次工作回合，记录时不会单独发信或唤起 Claude。用 `handoff.py show --side cc --progress` 查询带入状态。[进度记录用法](daily/换新说明.md#进度留到下次-claude-判断)
+
 用户裁决后，用 `daily/handoff.py focus` 更新现行方案、已结案事项和下一步，用 `--keep` 保留仍适用的约束和样品。[交接首页用法](daily/换新说明.md#裁决后的交接首页)
 
 需要更换配对中的一端时，可记录已确认的方向、证据和未完事项，由新会话核对材料后接管；另一端沿用原聊天。只有交接状态为 `committed` 才算完成。[单侧换新说明](daily/换新说明.md)

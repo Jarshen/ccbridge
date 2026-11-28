@@ -1105,3 +1105,65 @@ test('explicit long send and reverse file review preserve full reports and rejec
   assert.equal(f.db.prepare('SELECT full_text FROM review_reports WHERE request_id=?').get(request).full_text,full);
   fs.writeFileSync(file,full+' correction');assert.throws(send);
 });
+
+function progressCli(f,...args) {
+  return JSON.parse(execFileSync(python,['-B','-X','utf8','handoff.py','--store',f.storePath,...args],{
+    cwd:daily,encoding:'utf8',windowsHide:true,stdio:['ignore','pipe','pipe']}));
+}
+
+test('explicit status is silent until a real review, survives restart and preserves ordinary immediate letters',async t=>{
+  const f=fixture(t),p=f.pair,first=f.boot();
+  await first.turn(p,'setup');await first.tick();
+  const note=(rev,topic,kind,src,text)=>progressCli(f,'note','--binding','1','--base',String(rev),'--topic',topic,
+    '--kind',kind,'--source',src,'--text',text,'--evidence','fixture','--next-cc');
+  const status=()=>progressCli(f,'show','--binding','1','--side','cc','--progress').progress;
+  const before=first.calls.length;
+  const r=note(0,'authority','用户授权','用户','test-authorized');
+  note(r.revision,'result','实测事实','Astra','verified-sample-491');
+  await first.tick();await first.tick();
+  assert.equal(first.calls.length,before);assert.equal(f.mail().length,0);assert.deepEqual(status().map(n=>n.state),['pending','pending']);
+  const h=f.boot(),id=randomUUID();
+  reviewRelay(f,p.desktop,'send','--binding','1','--id',id,'--text','judge sample','--review');
+  h.beforeComplete=()=>{note(2,'next measurement','实测事实','Astra','newer-during-run');};
+  h.answer='Keep sample.';await h.tick();delete h.beforeComplete;
+  const prompt=h.requests[0].content;assert.match(prompt,/judge sample/);assert.match(prompt,/verified-sample-491/);
+  assert.match(prompt,/test-authorized/);assert.doesNotMatch(prompt,/newer-during-run/);
+  assert.deepEqual(status().map(n=>n.state),['included','included','pending']);
+  f.store('desktop_send',p.desktop,'urgent correction',randomUUID());await h.tick();await h.tick();
+  assert.match(h.requests.at(-1).content,/urgent correction/);assert.match(h.requests.at(-1).content,/newer-during-run/);
+  assert.doesNotMatch(h.requests.at(-1).content,/verified-sample-491/);assert.equal(status().at(-1).state,'included');
+  await h.turn(p,'another user decision');assert.doesNotMatch(h.calls.at(-1).command,/已记录的项目进度/);
+});
+
+test('interactive Claude sees only current progress of its route and failed turns leave it pending',async t=>{
+  const f=fixture(t),p=f.pair,h=f.boot(),other=f.session();
+  await h.turn(p,'setup');await h.tick();
+  const put=(rev,text,...opts)=>progressCli(f,'note','--binding','1','--base',String(rev),'--topic','sample',
+    '--kind','实测事实','--source','Astra','--text',text,'--evidence','fixture',...opts);
+  put(0,'stale-status','--next-cc');put(1,'current-status','--next-cc');
+  assert.throws(()=>put(2,'private','--next-cc','--audience','desktop'));
+  await h.turn(other,'other project');assert.doesNotMatch(h.calls.at(-1).command,/current-status/);
+  await h.turn(p,'发给 Astra：check');assert.doesNotMatch(h.calls.at(-1).command,/current-status/);
+  await h.turn(p,'/compact');assert.doesNotMatch(h.calls.at(-1).command,/current-status/);
+  h.aborted=true;await h.turn(p,'user decision');assert.match(h.calls.at(-1).command,/current-status/);
+  h.aborted=false;await h.turn(p,'resume decision');assert.match(h.calls.at(-1).command,/current-status/);
+  assert.doesNotMatch(h.calls.at(-1).command,/stale-status/);
+  const state=progressCli(f,'show','--side','cc','--binding','1','--progress').progress;
+  assert.deepEqual(state.map(n=>n.state),['superseded','included']);
+  put(2,'superseded-by-private','--next-cc');put(3,'private-substitution','--audience','desktop');
+  await h.turn(p,'decision');assert.doesNotMatch(h.calls.at(-1).command,/superseded-by-private|private-substitution/);
+});
+
+test('a bounded progress digest retains the lookup and focus retires excluded notes',async t=>{
+  const f=fixture(t),h=f.boot();
+  for(let i=0;i<8;i++) progressCli(f,'note','--binding','1','--base',String(i),'--topic','fact'+i,
+    '--kind','实测事实','--text','item'+i+'x'.repeat(i===7?800:10),'--evidence','fixture','--next-cc');
+  progressCli(f,'focus','--binding','1','--base','8','--adopted','v2','--closed','old paths','--next-step','compare',
+    '--evidence','decision',...Array.from({length:7},(_,i)=>['--keep',String(i+2)]).flat());
+  await h.turn(f.pair,'decide');
+  const prompt=h.calls.at(-1).command;assert.match(prompt,/共有 7 条/);assert.doesNotMatch(prompt,/item0|x{300}/);
+  assert.match(prompt,/--since 2 --through 8/);
+  const rows=progressCli(f,'show','--side','cc','--binding','1','--progress','--since','2','--through','8').progress;
+  assert.equal(rows.length,7);assert.equal(rows.at(-1).body.length,805);
+  assert.deepEqual(rows.map(r=>r.state),['referenced','referenced','included','included','included','included','referenced']);
+});

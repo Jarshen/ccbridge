@@ -164,3 +164,19 @@ test('focus replaces history in both packets, preserves live constraints, versio
   const archived=f.cli('show','--binding','1','--side','cc','--history','--through',String(rev));
   assert.deepEqual(archived.notes.map(n=>n.topic),['colour','trial A','trial B']);assert.equal(archived.overviews.length,1);
 });
+
+for(const side of ['cc','desktop']) test('silent progress follows an explicit takeover: '+side,async t=>{
+  const f=fixture(t,side);
+  f.cli('note','--binding','1','--base','1','--topic','delivery','--kind','实测事实','--source','Astra',
+    '--text','stage complete','--evidence','workspace result','--next-cc');
+  const packet=f.cli('prepare','--binding','1','--side',side,'--index',path.join(path.dirname(f.store),'index.sqlite'),
+    '--candidate',f.candidate,'--work','compare the sample');
+  const answer='Only compare the delivered sample.\n接续核对 '+packet.ticket;
+  if(side==='cc') f.host.claimReadback('接续检查 '+packet.ticket,{sessionId:f.candidate,cwd:path.dirname(f.store)}).finish(answer);
+  else f.idx.prepare("INSERT INTO thread_items VALUES(?,'turn','final','agentMessage',?)").run(f.candidate,JSON.stringify({type:'agentMessage',text:answer}));
+  f.cli('request',packet.ticket);await f.host.tick();
+  const state=f.cli('status',packet.ticket);
+  assert.equal(state.state,'committed',state.detail);
+  const inherited=f.cli('show','--binding',String(state.successor),'--side','cc','--progress').progress;
+  assert.deepEqual(inherited.map(n=>n.state),[side==='cc'?'included':'pending']);
+});

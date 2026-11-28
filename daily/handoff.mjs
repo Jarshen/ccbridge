@@ -137,6 +137,10 @@ export function handoffs({db,desktopDb,sessions,runtime,runRegistry,externalBusy
     if (exists('receiver'))
       db.prepare('INSERT INTO receiver(binding_id,user_id,options) SELECT ?,user_id,options FROM receiver WHERE binding_id=?').run(id,b.id);
     db.prepare('INSERT INTO continuity_links VALUES(?,?)').run(id,t.root);
+    if(t.side==='cc' && exists('continuity_cc_progress')) {
+      const inherited=JSON.parse(t.packet).notes.map(n=>n.rev);
+      db.prepare("UPDATE continuity_cc_progress SET state='included' WHERE state='pending' AND rev IN (SELECT value FROM json_each(?))").run(JSON.stringify(inherited));
+    }
     db.prepare("UPDATE continuity_tickets SET state='committed',successor=?,readback=?,detail=NULL WHERE id=?").run(id,readback,t.id);
   });
   let checking=false;

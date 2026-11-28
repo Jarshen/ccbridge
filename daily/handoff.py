@@ -21,6 +21,10 @@ CREATE TABLE IF NOT EXISTS continuity_notes(
  audience TEXT NOT NULL, body TEXT NOT NULL, evidence TEXT NOT NULL, binding_id INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS continuity_files(rev INTEGER PRIMARY KEY REFERENCES continuity_notes(rev),path TEXT NOT NULL,digest TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS continuity_sources(rev INTEGER PRIMARY KEY REFERENCES continuity_notes(rev),source TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS continuity_cc_progress(
+ rev INTEGER PRIMARY KEY REFERENCES continuity_notes(rev),
+ state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','included','referenced','superseded')));
+CREATE INDEX IF NOT EXISTS continuity_pending_progress ON continuity_cc_progress(rev) WHERE state='pending';
 CREATE TABLE IF NOT EXISTS continuity_focus(
  rev INTEGER PRIMARY KEY REFERENCES continuity_notes(rev),adopted TEXT NOT NULL,closed TEXT NOT NULL,
  next_step TEXT NOT NULL,keep_revs TEXT NOT NULL);
@@ -70,6 +74,15 @@ def overview(db, root, side):
 
 def revision(db, root):
     return db.execute("SELECT coalesce(max(rev),0) FROM continuity_notes WHERE root=?", (root,)).fetchone()[0]
+
+
+def prune_progress(db,root):
+    pending=db.execute("""SELECT p.rev FROM continuity_cc_progress p JOIN continuity_notes n USING(rev)
+                         WHERE n.root=? AND p.state='pending'""",(root,)).fetchall()
+    if pending:
+        visible={n["rev"] for n in overview(db,root,"cc")["notes"]}
+        db.executemany("UPDATE continuity_cc_progress SET state='superseded' WHERE rev=?",
+                       [(r[0],) for r in pending if r[0] not in visible])
 
 
 def run(args):
@@ -123,6 +136,15 @@ def run(args):
             return dict(request=args.request_id,closed_reason=args.reason)
         rev = revision(db, root)
         if args.command == "show":
+            if args.progress:
+                if args.side!="cc":
+                    raise ValueError("延后带入的是 Claude 侧共享进度，请使用 --side cc")
+                rows=db.execute("""SELECT n.rev,n.topic,n.kind,s.source,n.body,n.evidence,f.path,f.digest,p.state
+                    FROM continuity_cc_progress p JOIN continuity_notes n USING(rev)
+                    LEFT JOIN continuity_sources s USING(rev) LEFT JOIN continuity_files f USING(rev)
+                    WHERE n.root=? AND n.audience IN ('cc','both') AND n.rev BETWEEN ? AND ? ORDER BY n.rev""",
+                    (root,args.since,rev if args.through is None else args.through))
+                return dict(binding=args.binding,revision=rev,progress=[dict(r) for r in rows])
             data=overview(db,root,args.side)
             return dict(binding=args.binding,revision=rev,**data)
         if args.command=="focus":
@@ -137,12 +159,15 @@ def run(args):
                 VALUES(?,'交接首页','交接首页','both',?,?,?)""",(root,args.adopted,args.evidence,args.binding))
             db.execute("INSERT INTO continuity_focus VALUES(?,?,?,?,?)",(entry.lastrowid,args.adopted,
                        args.closed,args.next_step,json.dumps(args.keep)))
+            prune_progress(db,root)
             return dict(revision=entry.lastrowid,overview=overview(db,root,"cc")["overview"])
         if args.command == "note":
             if args.base != rev:
                 raise ValueError(f"方向已更新到 {rev}，请先 show 再核对迟到结果")
             if not all(s.strip() for s in (args.topic, args.text, args.evidence)):
                 raise ValueError("需要事项、实际变化与可回查的依据")
+            if args.next_cc and args.audience=="desktop":
+                raise ValueError("仅 Astra 可见的记录不能带入 Claude 回合")
             source=args.source
             if args.kind=="用户授权":
                 source=source or "用户"
@@ -161,6 +186,19 @@ def run(args):
                 with path.open('rb') as src:
                     digest = hashlib.file_digest(src,'sha256').hexdigest()
                 db.execute("INSERT INTO continuity_files VALUES(?,?,?)",(row.lastrowid,str(path),digest))
+            if args.next_cc:
+                db.execute("INSERT INTO continuity_cc_progress(rev) VALUES(?)",(row.lastrowid,))
+            prune_progress(db,root)
+            if args.next_cc:
+                message="已记入共享状态，等待下次 Claude 业务回合"
+                try:
+                    pulse=json.loads(store.with_name("status.json").read_text(encoding="utf8"))
+                    if (isinstance(pulse,dict) and pulse.get("state")=="ready"
+                            and Path(pulse.get("store") or "").resolve()==store and not pulse.get("ccProgress")):
+                        message+="；此库最近的就绪记录来自旧版宿主，正常重启新版工作台后生效"
+                except (OSError,TypeError,ValueError):
+                    pass  # The durable status remains pending even when the host is offline.
+                return dict(revision=row.lastrowid,progress="pending",message=message)
             return dict(revision=row.lastrowid)
         candidate = next((r for r in list_sessions(args.side, args.index) if r["id"] == args.candidate), None)
         if not candidate or Path(candidate["cwd"]) != Path(route[args.side+"_cwd"]):
@@ -216,10 +254,14 @@ def main():
             cmd.add_argument("--text",required=True)
             cmd.add_argument("--evidence",required=True)
             cmd.add_argument("--file",type=Path,help="固定本地样品版本；换新时复核 SHA-256")
+            cmd.add_argument("--next-cc",action="store_true",help="只记状态，在下次 Claude 业务回合带入")
         else:
             cmd.add_argument("--side",choices=["cc","desktop"],required=True)
             if name=="show":
-                cmd.add_argument("--history",action="store_true",help="展开角色可见的历史记录及原始依据")
+                view=cmd.add_mutually_exclusive_group()
+                view.add_argument("--history",action="store_true",help="展开角色可见的历史记录及原始依据")
+                view.add_argument("--progress",action="store_true",help="查看延后带入的进度及状态")
+                cmd.add_argument("--since",type=int,default=0,help="进度查询的起始版本（含）")
                 cmd.add_argument("--through",type=int,help="展开历史截至此版本")
         if name == "prepare":
             cmd.add_argument("--index",type=Path,required=True)
